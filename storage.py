@@ -13,865 +13,1568 @@ SQLite + файловое хранилище для Streamlit-приложени
 from __future__ import annotations
 
 import json
-import os
-import re
-import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Iterable, Iterator, Optional
 
-JsonDict = Dict[str, Any]
+SCHEMA_VERSION = 2
+
+STATUS_DRAFT = "draft"
+STATUS_NEEDS_CLARIFICATION = "needs_clarification"
+STATUS_ALIGNED = "aligned"
+STATUS_REJECTED = "rejected"
+STATUS_FINALIZED = "finalized"
+
+SIDE_STUDENT = "student"
+SIDE_TEACHER = "teacher"
+SIDE_SYSTEM = "system"
+
+MATERIAL_ROLE_STUDENT = "student"
+MATERIAL_ROLE_TEACHER = "teacher"
+MATERIAL_ROLE_SYSTEM = "system"
+
+MATERIAL_STAGE_TOPIC_ALIGNMENT = "topic_alignment"
+MATERIAL_STAGE_METHODICS = "methodics"
+MATERIAL_STAGE_SUBMISSION = "submission"
+MATERIAL_STAGE_GENERAL = "general"
+
+WORK_TYPE_LAB = "lab"
+WORK_TYPE_PRACTICE = "practice"
+WORK_TYPE_RESEARCH = "research"
+WORK_TYPE_COURSEWORK = "coursework"
+WORK_TYPE_REPORT = "report"
+WORK_TYPE_OTHER = "other"
 
 
 # Helpers
 
 
-def now_iso() -> str:
-    """UTC ISO-8601 timestamp."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def new_id(prefix: str) -> str:
-    """Generate stable, unique IDs like lab_xxx, mat_xxx, sub_xxx, etc."""
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
-def _safe_filename(name: str, max_len: int = 120) -> str:
-    """Sanitize filenames for disk storage."""
-    name = name.strip().replace("\\", "_").replace("/", "_")
-    name = re.sub(r"[^A-Za-z0-9А-Яа-яЁё_.\-\s]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    if not name:
-        name = "file"
-    if len(name) > max_len:
-        stem, ext = os.path.splitext(name)
-        name = stem[: max_len - len(ext)] + ext
-    return name
+def dumps_json(value: Any) -> str:
+    if value is None:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+def loads_json(value: Optional[str], default: Any = None) -> Any:
+    if value is None or value == "":
+        return {} if default is None else default
+    try:
+        return json.loads(value)
+    except Exception:
+        return {} if default is None else default
 
 
-def _json_loads(s: Optional[str]) -> Any:
-    if not s:
+def row_to_dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
+    if row is None:
         return None
-    return json.loads(s)
+    return {key: row[key] for key in row.keys()}
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+    return [row_to_dict(row) for row in rows if row is not None]  # type: ignore[arg-type]
 
 
-def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding=encoding)
-    tmp.replace(path)
-
-
-# Data classes (returns)
-
-
-@dataclass(frozen=True)
-class Lab:
-    lab_id: str
-    title: str
-    status: str
-    config: JsonDict
-    created_at: str
-    updated_at: str
-    published_version: int
-
-
-@dataclass(frozen=True)
-class Material:
-    material_id: str
-    lab_id: str
-    kind: str
-    filename: str
-    mime: str
-    original_path: str
-    extracted_text_path: str
-    meta: JsonDict
-    created_at: str
-
-
-@dataclass(frozen=True)
-class Submission:
-    submission_id: str
-    lab_id: str
-    student_id: Optional[str]
-    filename: str
-    mime: str
-    original_path: str
-    extracted_text_path: str
-    meta: JsonDict
-    created_at: str
-
-
-@dataclass(frozen=True)
-class DefenseSession:
-    session_id: str
-    lab_id: str
-    submission_id: str
-    student_label: str
-    status: str
-    started_at: str
-    finished_at: Optional[str]
-    policy_version: int
-    system_summary: JsonDict
-    teacher_summary: JsonDict
-
-
-# Storage main
+# Main storage
 
 
 class Storage:
-    """
-    Основная точка доступа к данным.
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    По умолчанию:
-      data_root = ./data
-      db_path   = ./data/app.sqlite3
-
-    Можно переопределить через env:
-      APP_DATA_DIR
-      APP_DB_PATH
-    """
-
-    SCHEMA_VERSION = 1
-
-    def __init__(self, data_root: Optional[Union[str, Path]] = None, db_path: Optional[Union[str, Path]] = None):
-        env_data_dir = os.getenv("APP_DATA_DIR")
-        env_db_path = os.getenv("APP_DB_PATH")
-
-        self.data_root = Path(data_root or env_data_dir or "./data").resolve()
-        self.db_path = Path(db_path or env_db_path or (self.data_root / "app.sqlite3")).resolve()
-
-        self.data_root.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    # SQLite utilities
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None, check_same_thread=False)
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
-        return conn
-
-    @contextmanager
-    def _tx(self) -> Iterable[sqlite3.Connection]:
-        conn = self._connect()
         try:
-            conn.execute("BEGIN;")
             yield conn
-            conn.execute("COMMIT;")
+            conn.commit()
         except Exception:
-            conn.execute("ROLLBACK;")
+            conn.rollback()
             raise
         finally:
             conn.close()
 
-    def _init_db(self) -> None:
-        with self._tx() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS schema_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-            """)
-            row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version';").fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO schema_meta(key,value) VALUES('schema_version', ?);",
-                    (str(self.SCHEMA_VERSION),)
-                )
-            else:
-                ver = int(row["value"])
-                if ver != self.SCHEMA_VERSION:
-                    # Для учебного проекта: простая защита от несовместимости
-                    raise RuntimeError(f"DB schema_version={ver} != expected {self.SCHEMA_VERSION}. Migration needed.")
+    # Schema / migration
 
-            # Main tables
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS labs (
-                    lab_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    config_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    published_version INTEGER NOT NULL DEFAULT 0
-                );
-            """)
+    def init_db(self) -> None:
+        with self.connect() as conn:
+            current_version = self._get_user_version(conn)
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id TEXT PRIMARY KEY,
-                    lab_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    filename TEXT NOT NULL,
-                    mime TEXT NOT NULL,
-                    original_path TEXT NOT NULL,
-                    extracted_text_path TEXT NOT NULL,
-                    meta_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE
-                );
-            """)
+            if current_version == 0:
+                self._create_schema_v2(conn)
+                self._set_user_version(conn, SCHEMA_VERSION)
+                return
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS submissions (
-                    submission_id TEXT PRIMARY KEY,
-                    lab_id TEXT NOT NULL,
-                    student_id TEXT,
-                    filename TEXT NOT NULL,
-                    mime TEXT NOT NULL,
-                    original_path TEXT NOT NULL,
-                    extracted_text_path TEXT NOT NULL,
-                    meta_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE
-                );
-            """)
+            if current_version < SCHEMA_VERSION:
+                self._migrate_to_v2_best_effort(conn)
+                self._set_user_version(conn, SCHEMA_VERSION)
+                return
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS defense_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    lab_id TEXT NOT NULL,
-                    submission_id TEXT NOT NULL,
-                    student_label TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    policy_version INTEGER NOT NULL DEFAULT 0,
-                    system_summary_json TEXT NOT NULL DEFAULT '{}',
-                    teacher_summary_json TEXT NOT NULL DEFAULT '{}',
-                    FOREIGN KEY(lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE,
-                    FOREIGN KEY(submission_id) REFERENCES submissions(submission_id) ON DELETE CASCADE
-                );
-            """)
+            # На случай, если версия уже равна 2, но каких-то таблиц нет
+            self._create_schema_v2(conn)
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS qa_turns (
-                    turn_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    idx INTEGER NOT NULL,
-                    question_json TEXT NOT NULL,
-                    answer_text TEXT NOT NULL DEFAULT '',
-                    answer_json TEXT NOT NULL DEFAULT '{}',
-                    system_eval_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(session_id) REFERENCES defense_sessions(session_id) ON DELETE CASCADE
-                );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_qa_turns_session_idx ON qa_turns(session_id, idx);")
+    def _get_user_version(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute("PRAGMA user_version;").fetchone()
+        return int(row[0]) if row else 0
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS student_feedback (
-                    feedback_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    rating INTEGER,
-                    comment TEXT NOT NULL DEFAULT '',
-                    tags_json TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(session_id) REFERENCES defense_sessions(session_id) ON DELETE CASCADE
-                );
-            """)
+    def _set_user_version(self, conn: sqlite3.Connection, version: int) -> None:
+        conn.execute(f"PRAGMA user_version = {int(version)};")
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS teacher_feedback (
-                    feedback_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    target TEXT NOT NULL, -- 'question' | 'answer' | 'session'
-                    turn_id TEXT,         -- nullable for session-level feedback
-                    label TEXT NOT NULL,  -- 'good' | 'bad'
-                    score REAL,
-                    reason_tags_json TEXT NOT NULL DEFAULT '[]',
-                    comment TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(session_id) REFERENCES defense_sessions(session_id) ON DELETE CASCADE,
-                    FOREIGN KEY(turn_id) REFERENCES qa_turns(turn_id) ON DELETE SET NULL
-                );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_teacher_feedback_session ON teacher_feedback(session_id);")
+    def _create_schema_v2(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS labs (
+                lab_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                work_type TEXT NOT NULL DEFAULT 'other',
+                status TEXT NOT NULL DEFAULT 'draft',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                agreed_spec_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS policy_items (
-                    item_id TEXT PRIMARY KEY,
-                    lab_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,   -- 'good_question'|'bad_question'|'note' etc.
-                    content_json TEXT NOT NULL,
-                    reason_tags_json TEXT NOT NULL DEFAULT '[]',
-                    source_feedback_id TEXT,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE,
-                    FOREIGN KEY(source_feedback_id) REFERENCES teacher_feedback(feedback_id) ON DELETE SET NULL
-                );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_items_lab_kind ON policy_items(lab_id, kind);")
+            CREATE INDEX IF NOT EXISTS idx_labs_status ON labs(status);
+            CREATE INDEX IF NOT EXISTS idx_labs_work_type ON labs(work_type);
 
-    # Paths
+            CREATE TABLE IF NOT EXISTS materials (
+                material_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                owner_role TEXT NOT NULL DEFAULT 'teacher',
+                stage TEXT NOT NULL DEFAULT 'general',
+                title TEXT DEFAULT '',
+                filename TEXT NOT NULL,
+                mime_type TEXT DEFAULT '',
+                file_path TEXT DEFAULT '',
+                extracted_text TEXT DEFAULT '',
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE
+            );
 
-    def lab_dir(self, lab_id: str) -> Path:
-        return self.data_root / "labs" / lab_id
+            CREATE INDEX IF NOT EXISTS idx_materials_lab_id ON materials(lab_id);
+            CREATE INDEX IF NOT EXISTS idx_materials_stage ON materials(stage);
+            CREATE INDEX IF NOT EXISTS idx_materials_owner_role ON materials(owner_role);
 
-    def _materials_dir(self, lab_id: str) -> Path:
-        return self.lab_dir(lab_id) / "materials"
+            CREATE TABLE IF NOT EXISTS topic_sessions (
+                topic_session_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                round_no INTEGER NOT NULL DEFAULT 0,
+                relation_score REAL,
+                relation_label TEXT DEFAULT '',
+                summary_text TEXT DEFAULT '',
+                llm_assessment_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE
+            );
 
-    def _submissions_dir(self, lab_id: str) -> Path:
-        return self.lab_dir(lab_id) / "submissions"
+            CREATE INDEX IF NOT EXISTS idx_topic_sessions_lab_id ON topic_sessions(lab_id);
+            CREATE INDEX IF NOT EXISTS idx_topic_sessions_status ON topic_sessions(status);
 
-    def _extracts_dir(self, lab_id: str) -> Path:
-        return self.lab_dir(lab_id) / "extracts"
+            CREATE TABLE IF NOT EXISTS topic_inputs (
+                topic_input_id TEXT PRIMARY KEY,
+                topic_session_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                context_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(topic_session_id, side),
+                FOREIGN KEY (topic_session_id) REFERENCES topic_sessions(topic_session_id) ON DELETE CASCADE
+            );
 
-    def _exports_dir(self, lab_id: str) -> Path:
-        return self.lab_dir(lab_id) / "exports"
+            CREATE INDEX IF NOT EXISTS idx_topic_inputs_session_id ON topic_inputs(topic_session_id);
+            CREATE INDEX IF NOT EXISTS idx_topic_inputs_side ON topic_inputs(side);
 
-    # Labs
+            CREATE TABLE IF NOT EXISTS topic_turns (
+                topic_turn_id TEXT PRIMARY KEY,
+                topic_session_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                turn_kind TEXT NOT NULL,
+                question_text TEXT DEFAULT '',
+                answer_text TEXT DEFAULT '',
+                extra_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (topic_session_id) REFERENCES topic_sessions(topic_session_id) ON DELETE CASCADE
+            );
 
-    def create_lab(self, title: str, config: Optional[JsonDict] = None, status: str = "draft") -> Lab:
+            CREATE INDEX IF NOT EXISTS idx_topic_turns_session_id ON topic_turns(topic_session_id);
+            CREATE INDEX IF NOT EXISTS idx_topic_turns_side ON topic_turns(side);
+
+            CREATE TABLE IF NOT EXISTS agreed_specs (
+                spec_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                topic_session_id TEXT,
+                work_type TEXT NOT NULL DEFAULT 'other',
+                agreed_title TEXT NOT NULL,
+                agreed_description TEXT DEFAULT '',
+                acceptance_criteria_json TEXT NOT NULL DEFAULT '{}',
+                generated_from_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'finalized',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE,
+                FOREIGN KEY (topic_session_id) REFERENCES topic_sessions(topic_session_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agreed_specs_lab_id ON agreed_specs(lab_id);
+
+            CREATE TABLE IF NOT EXISTS submissions (
+                submission_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                student_name TEXT DEFAULT '',
+                title TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                file_bundle_json TEXT NOT NULL DEFAULT '{}',
+                analysis_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_submissions_lab_id ON submissions(lab_id);
+
+            CREATE TABLE IF NOT EXISTS defense_sessions (
+                defense_session_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                submission_id TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                plan_json TEXT NOT NULL DEFAULT '{}',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                score_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE,
+                FOREIGN KEY (submission_id) REFERENCES submissions(submission_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_defense_sessions_lab_id ON defense_sessions(lab_id);
+            CREATE INDEX IF NOT EXISTS idx_defense_sessions_submission_id ON defense_sessions(submission_id);
+
+            CREATE TABLE IF NOT EXISTS qa_turns (
+                qa_turn_id TEXT PRIMARY KEY,
+                defense_session_id TEXT NOT NULL,
+                question_text TEXT NOT NULL,
+                answer_text TEXT DEFAULT '',
+                evaluation_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (defense_session_id) REFERENCES defense_sessions(defense_session_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_qa_turns_defense_session_id ON qa_turns(defense_session_id);
+
+            CREATE TABLE IF NOT EXISTS teacher_feedback (
+                teacher_feedback_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                defense_session_id TEXT,
+                feedback_text TEXT NOT NULL,
+                extra_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE,
+                FOREIGN KEY (defense_session_id) REFERENCES defense_sessions(defense_session_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_teacher_feedback_lab_id ON teacher_feedback(lab_id);
+
+            CREATE TABLE IF NOT EXISTS student_feedback (
+                student_feedback_id TEXT PRIMARY KEY,
+                lab_id TEXT NOT NULL,
+                defense_session_id TEXT,
+                feedback_text TEXT NOT NULL,
+                extra_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE,
+                FOREIGN KEY (defense_session_id) REFERENCES defense_sessions(defense_session_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_student_feedback_lab_id ON student_feedback(lab_id);
+
+            CREATE TABLE IF NOT EXISTS policy_items (
+                policy_item_id TEXT PRIMARY KEY,
+                lab_id TEXT,
+                kind TEXT NOT NULL DEFAULT 'general',
+                title TEXT NOT NULL,
+                body_text TEXT NOT NULL,
+                score REAL,
+                source TEXT NOT NULL DEFAULT 'teacher_feedback',
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_policy_items_lab_id ON policy_items(lab_id);
+            CREATE INDEX IF NOT EXISTS idx_policy_items_kind ON policy_items(kind);
+            """
+        )
+
+    def _migrate_to_v2_best_effort(self, conn: sqlite3.Connection) -> None:
+        """
+        Мягкая миграция без предположений о полной старой схеме.
+        Если таблиц/колонок нет — создаем.
+        Если таблицы есть, но не хватает колонок — добавляем.
+        """
+        self._create_schema_v2(conn)
+
+        self._ensure_column(conn, "labs", "work_type", "TEXT NOT NULL DEFAULT 'other'")
+        self._ensure_column(conn, "labs", "status", "TEXT NOT NULL DEFAULT 'draft'")
+        self._ensure_column(conn, "labs", "config_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "labs", "agreed_spec_id", "TEXT")
+        self._ensure_column(conn, "labs", "updated_at", "TEXT")
+
+        self._ensure_column(conn, "materials", "owner_role", "TEXT NOT NULL DEFAULT 'teacher'")
+        self._ensure_column(conn, "materials", "stage", "TEXT NOT NULL DEFAULT 'general'")
+        self._ensure_column(conn, "materials", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "materials", "extracted_text", "TEXT DEFAULT ''")
+
+        # Подтягиваем updated_at там, где нужно
+        self._ensure_column(conn, "submissions", "updated_at", "TEXT")
+        self._ensure_column(conn, "defense_sessions", "updated_at", "TEXT")
+
+        # Если updated_at пустой — выставим created_at
+        self._backfill_updated_at(conn, "labs")
+        self._backfill_updated_at(conn, "submissions")
+        self._backfill_updated_at(conn, "defense_sessions")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = self._get_table_columns(conn, table)
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition};")
+
+    def _get_table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
+        return {row["name"] for row in rows}
+
+    def _backfill_updated_at(self, conn: sqlite3.Connection, table: str) -> None:
+        columns = self._get_table_columns(conn, table)
+        if "created_at" in columns and "updated_at" in columns:
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET updated_at = COALESCE(updated_at, created_at, ?)
+                WHERE updated_at IS NULL OR updated_at = '';
+                """,
+                (utc_now(),),
+            )
+
+    # Labs / assignments
+
+    def create_lab(
+            self,
+            *,
+            title: str,
+            description: str = "",
+            work_type: str = WORK_TYPE_OTHER,
+            status: str = STATUS_DRAFT,
+            config: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         lab_id = new_id("lab")
-        created = now_iso()
-        cfg = config or default_lab_config()
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO labs(lab_id,title,status,config_json,created_at,updated_at,published_version)
-                VALUES(?,?,?,?,?,?,0);
-            """, (lab_id, title.strip(), status, _json_dumps(cfg), created, created))
-        # ensure dirs exist
-        self._materials_dir(lab_id).mkdir(parents=True, exist_ok=True)
-        self._submissions_dir(lab_id).mkdir(parents=True, exist_ok=True)
-        self._extracts_dir(lab_id).mkdir(parents=True, exist_ok=True)
-        self._exports_dir(lab_id).mkdir(parents=True, exist_ok=True)
-        return self.get_lab(lab_id)
+        now = utc_now()
 
-    def list_labs(self) -> List[Lab]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM labs ORDER BY created_at DESC;").fetchall()
-        return [self._row_to_lab(r) for r in rows]
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO labs (
+                    lab_id, title, description, work_type, status, config_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (lab_id, title, description, work_type, status, dumps_json(config), now, now),
+            )
+            row = conn.execute("SELECT * FROM labs WHERE lab_id = ?;", (lab_id,)).fetchone()
+            return self._decode_lab(row_to_dict(row))
 
-    def get_lab(self, lab_id: str) -> Lab:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM labs WHERE lab_id=?;", (lab_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"Lab not found: {lab_id}")
-        return self._row_to_lab(row)
+    def list_labs(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM labs ORDER BY created_at DESC, title ASC;"
+            ).fetchall()
+            return [self._decode_lab(item) for item in rows_to_dicts(rows)]
 
-    def update_lab(self, lab_id: str, *, title: Optional[str] = None, status: Optional[str] = None,
-                   config: Optional[JsonDict] = None) -> Lab:
-        lab = self.get_lab(lab_id)
-        new_title = title.strip() if title is not None else lab.title
-        new_status = status if status is not None else lab.status
-        new_cfg = config if config is not None else lab.config
-        updated = now_iso()
-        with self._tx() as conn:
-            conn.execute("""
+    def get_lab(self, lab_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM labs WHERE lab_id = ?;", (lab_id,)).fetchone()
+            return self._decode_lab(row_to_dict(row))
+
+    def update_lab(
+            self,
+            lab_id: str,
+            *,
+            title: Optional[str] = None,
+            description: Optional[str] = None,
+            work_type: Optional[str] = None,
+            status: Optional[str] = None,
+            config: Optional[dict[str, Any]] = None,
+            agreed_spec_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        current = self.get_lab(lab_id)
+        if not current:
+            return None
+
+        merged_config = current["config_json"]
+        if config is not None:
+            merged = dict(merged_config)
+            merged.update(config)
+            merged_config = merged
+
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
                 UPDATE labs
-                SET title=?, status=?, config_json=?, updated_at=?
-                WHERE lab_id=?;
-            """, (new_title, new_status, _json_dumps(new_cfg), updated, lab_id))
-        return self.get_lab(lab_id)
+                SET
+                    title = ?,
+                    description = ?,
+                    work_type = ?,
+                    status = ?,
+                    config_json = ?,
+                    agreed_spec_id = ?,
+                    updated_at = ?
+                WHERE lab_id = ?;
+                """,
+                (
+                    title if title is not None else current["title"],
+                    description if description is not None else current["description"],
+                    work_type if work_type is not None else current["work_type"],
+                    status if status is not None else current["status"],
+                    dumps_json(merged_config),
+                    agreed_spec_id if agreed_spec_id is not None else current["agreed_spec_id"],
+                    now,
+                    lab_id,
+                ),
+            )
+            row = conn.execute("SELECT * FROM labs WHERE lab_id = ?;", (lab_id,)).fetchone()
+            return self._decode_lab(row_to_dict(row))
 
-    def publish_lab_version(self, lab_id: str) -> int:
-        """Increment published_version (useful to freeze teacher policy/config). Returns new version."""
-        with self._tx() as conn:
-            row = conn.execute("SELECT published_version FROM labs WHERE lab_id=?;", (lab_id,)).fetchone()
-            if row is None:
-                raise KeyError(f"Lab not found: {lab_id}")
-            new_ver = int(row["published_version"]) + 1
-            conn.execute("""
-                UPDATE labs SET published_version=?, updated_at=? WHERE lab_id=?;
-            """, (new_ver, now_iso(), lab_id))
-        return new_ver
+    def delete_lab(self, lab_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM labs WHERE lab_id = ?;", (lab_id,))
 
-    def delete_lab(self, lab_id: str, *, delete_files: bool = True) -> None:
-        """Delete lab record (cascades). Optionally delete lab directory."""
-        with self._tx() as conn:
-            conn.execute("DELETE FROM labs WHERE lab_id=?;", (lab_id,))
-        if delete_files:
-            lab_dir = self.lab_dir(lab_id)
-            if lab_dir.exists():
-                shutil.rmtree(lab_dir, ignore_errors=True)
-
-    # Materials (teacher uploads)
+    # Materials
 
     def add_material(
             self,
-            lab_id: str,
-            kind: str,
-            filename: str,
-            data: bytes,
             *,
-            mime: str = "application/octet-stream",
+            lab_id: str,
+            filename: str,
+            owner_role: str = MATERIAL_ROLE_TEACHER,
+            stage: str = MATERIAL_STAGE_GENERAL,
+            title: str = "",
+            mime_type: str = "",
+            file_path: str = "",
             extracted_text: str = "",
-            meta: Optional[JsonDict] = None
-    ) -> Material:
-        """Store teacher material file + extracted text (if you already parsed it)."""
-        _ = self.get_lab(lab_id)  # validate exists
-
+            meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         material_id = new_id("mat")
-        created = now_iso()
-        safe_name = _safe_filename(filename)
-        orig_path = self._materials_dir(lab_id) / f"{material_id}_{safe_name}"
-        text_path = self._extracts_dir(lab_id) / "materials" / f"{material_id}.txt"
+        now = utc_now()
 
-        _atomic_write_bytes(orig_path, data)
-        _atomic_write_text(text_path, extracted_text or "", encoding="utf-8")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO materials (
+                    material_id, lab_id, owner_role, stage, title, filename, mime_type,
+                    file_path, extracted_text, meta_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    material_id,
+                    lab_id,
+                    owner_role,
+                    stage,
+                    title,
+                    filename,
+                    mime_type,
+                    file_path,
+                    extracted_text,
+                    dumps_json(meta),
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM materials WHERE material_id = ?;", (material_id,)).fetchone()
+            return self._decode_material(row_to_dict(row))
 
-        m = meta or {}
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO materials(material_id,lab_id,kind,filename,mime,original_path,extracted_text_path,meta_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?);
-            """, (
-                material_id, lab_id, kind, safe_name, mime,
-                str(orig_path), str(text_path), _json_dumps(m), created
-            ))
-        return self.get_material(material_id)
-
-    def list_materials(self, lab_id: str) -> List[Material]:
-        with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT * FROM materials WHERE lab_id=? ORDER BY created_at DESC;
-            """, (lab_id,)).fetchall()
-        return [self._row_to_material(r) for r in rows]
-
-    def get_material(self, material_id: str) -> Material:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM materials WHERE material_id=?;", (material_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"Material not found: {material_id}")
-        return self._row_to_material(row)
-
-    def delete_material(self, material_id: str, *, delete_files: bool = True) -> None:
-        mat = self.get_material(material_id)
-        with self._tx() as conn:
-            conn.execute("DELETE FROM materials WHERE material_id=?;", (material_id,))
-        if delete_files:
-            for p in [Path(mat.original_path), Path(mat.extracted_text_path)]:
-                try:
-                    p.unlink(missing_ok=True)  # py3.8+ has missing_ok
-                except TypeError:
-                    if p.exists():
-                        p.unlink()
-
-    # Submissions (student uploads)
-
-    def add_submission(
+    def list_materials(
             self,
             lab_id: str,
-            filename: str,
-            data: bytes,
             *,
-            student_id: Optional[str] = None,
-            mime: str = "application/octet-stream",
-            extracted_text: str = "",
-            meta: Optional[JsonDict] = None
-    ) -> Submission:
-        """Store student submission file + extracted text."""
-        _ = self.get_lab(lab_id)  # validate exists
+            owner_role: Optional[str] = None,
+            stage: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        where = ["lab_id = ?"]
+        params: list[Any] = [lab_id]
 
+        if owner_role:
+            where.append("owner_role = ?")
+            params.append(owner_role)
+
+        if stage:
+            where.append("stage = ?")
+            params.append(stage)
+
+        sql = f"""
+        SELECT * FROM materials
+        WHERE {" AND ".join(where)}
+        ORDER BY created_at ASC, filename ASC;
+        """
+
+        with self.connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [self._decode_material(item) for item in rows_to_dicts(rows)]
+
+    def get_material(self, material_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM materials WHERE material_id = ?;", (material_id,)).fetchone()
+            return self._decode_material(row_to_dict(row))
+
+    def delete_material(self, material_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM materials WHERE material_id = ?;", (material_id,))
+
+    # Topic alignment
+
+    def create_topic_session(
+            self,
+            *,
+            lab_id: str,
+            status: str = STATUS_DRAFT,
+    ) -> dict[str, Any]:
+        topic_session_id = new_id("topic")
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO topic_sessions (
+                    topic_session_id, lab_id, status, round_no, relation_score, relation_label,
+                    summary_text, llm_assessment_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 0, NULL, '', '', '{}', ?, ?);
+                """,
+                (topic_session_id, lab_id, status, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM topic_sessions WHERE topic_session_id = ?;",
+                (topic_session_id,),
+            ).fetchone()
+            return self._decode_topic_session(row_to_dict(row))
+
+    def get_topic_session(self, topic_session_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM topic_sessions WHERE topic_session_id = ?;",
+                (topic_session_id,),
+            ).fetchone()
+            return self._decode_topic_session(row_to_dict(row))
+
+    def get_latest_topic_session_for_lab(self, lab_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM topic_sessions
+                WHERE lab_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1;
+                """,
+                (lab_id,),
+            ).fetchone()
+            return self._decode_topic_session(row_to_dict(row))
+
+    def update_topic_session(
+            self,
+            topic_session_id: str,
+            *,
+            status: Optional[str] = None,
+            round_no: Optional[int] = None,
+            relation_score: Optional[float] = None,
+            relation_label: Optional[str] = None,
+            summary_text: Optional[str] = None,
+            llm_assessment: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        current = self.get_topic_session(topic_session_id)
+        if not current:
+            return None
+
+        now = utc_now()
+
+        merged_assessment = current["llm_assessment_json"]
+        if llm_assessment is not None:
+            merged = dict(merged_assessment)
+            merged.update(llm_assessment)
+            merged_assessment = merged
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE topic_sessions
+                SET
+                    status = ?,
+                    round_no = ?,
+                    relation_score = ?,
+                    relation_label = ?,
+                    summary_text = ?,
+                    llm_assessment_json = ?,
+                    updated_at = ?
+                WHERE topic_session_id = ?;
+                """,
+                (
+                    status if status is not None else current["status"],
+                    round_no if round_no is not None else current["round_no"],
+                    relation_score if relation_score is not None else current["relation_score"],
+                    relation_label if relation_label is not None else current["relation_label"],
+                    summary_text if summary_text is not None else current["summary_text"],
+                    dumps_json(merged_assessment),
+                    now,
+                    topic_session_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM topic_sessions WHERE topic_session_id = ?;",
+                (topic_session_id,),
+            ).fetchone()
+            return self._decode_topic_session(row_to_dict(row))
+
+    def upsert_topic_input(
+            self,
+            *,
+            topic_session_id: str,
+            side: str,
+            title: str,
+            description: str = "",
+            context: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM topic_inputs
+                WHERE topic_session_id = ? AND side = ?;
+                """,
+                (topic_session_id, side),
+            ).fetchone()
+
+            if existing:
+                topic_input_id = existing["topic_input_id"]
+                current_context = loads_json(existing["context_json"], default={})
+                merged = dict(current_context)
+                if context:
+                    merged.update(context)
+
+                conn.execute(
+                    """
+                    UPDATE topic_inputs
+                    SET title = ?, description = ?, context_json = ?, updated_at = ?
+                    WHERE topic_input_id = ?;
+                    """,
+                    (title, description, dumps_json(merged), now, topic_input_id),
+                )
+            else:
+                topic_input_id = new_id("tinput")
+                conn.execute(
+                    """
+                    INSERT INTO topic_inputs (
+                        topic_input_id, topic_session_id, side, title, description,
+                        context_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        topic_input_id,
+                        topic_session_id,
+                        side,
+                        title,
+                        description,
+                        dumps_json(context),
+                        now,
+                        now,
+                    ),
+                )
+
+            row = conn.execute(
+                "SELECT * FROM topic_inputs WHERE topic_input_id = ?;",
+                (topic_input_id,),
+            ).fetchone()
+            return self._decode_topic_input(row_to_dict(row))
+
+    def list_topic_inputs(self, topic_session_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM topic_inputs
+                WHERE topic_session_id = ?
+                ORDER BY created_at ASC;
+                """,
+                (topic_session_id,),
+            ).fetchall()
+            return [self._decode_topic_input(item) for item in rows_to_dicts(rows)]
+
+    def get_topic_input(self, topic_session_id: str, side: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM topic_inputs
+                WHERE topic_session_id = ? AND side = ?;
+                """,
+                (topic_session_id, side),
+            ).fetchone()
+            return self._decode_topic_input(row_to_dict(row))
+
+    def add_topic_turn(
+            self,
+            *,
+            topic_session_id: str,
+            side: str,
+            turn_kind: str,
+            question_text: str = "",
+            answer_text: str = "",
+            extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        topic_turn_id = new_id("tturn")
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO topic_turns (
+                    topic_turn_id, topic_session_id, side, turn_kind,
+                    question_text, answer_text, extra_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    topic_turn_id,
+                    topic_session_id,
+                    side,
+                    turn_kind,
+                    question_text,
+                    answer_text,
+                    dumps_json(extra),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM topic_turns WHERE topic_turn_id = ?;",
+                (topic_turn_id,),
+            ).fetchone()
+            return self._decode_topic_turn(row_to_dict(row))
+
+    def list_topic_turns(self, topic_session_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM topic_turns
+                WHERE topic_session_id = ?
+                ORDER BY created_at ASC;
+                """,
+                (topic_session_id,),
+            ).fetchall()
+            return [self._decode_topic_turn(item) for item in rows_to_dicts(rows)]
+
+    # Agreed specification
+
+    def save_agreed_spec(
+            self,
+            *,
+            lab_id: str,
+            topic_session_id: Optional[str],
+            work_type: str,
+            agreed_title: str,
+            agreed_description: str = "",
+            acceptance_criteria: Optional[dict[str, Any]] = None,
+            generated_from: Optional[dict[str, Any]] = None,
+            status: str = STATUS_FINALIZED,
+    ) -> dict[str, Any]:
+        current = self.get_agreed_spec_by_lab(lab_id)
+        now = utc_now()
+
+        with self.connect() as conn:
+            if current:
+                spec_id = current["spec_id"]
+                conn.execute(
+                    """
+                    UPDATE agreed_specs
+                    SET
+                        topic_session_id = ?,
+                        work_type = ?,
+                        agreed_title = ?,
+                        agreed_description = ?,
+                        acceptance_criteria_json = ?,
+                        generated_from_json = ?,
+                        status = ?,
+                        updated_at = ?
+                    WHERE spec_id = ?;
+                    """,
+                    (
+                        topic_session_id,
+                        work_type,
+                        agreed_title,
+                        agreed_description,
+                        dumps_json(acceptance_criteria),
+                        dumps_json(generated_from),
+                        status,
+                        now,
+                        spec_id,
+                    ),
+                )
+            else:
+                spec_id = new_id("spec")
+                conn.execute(
+                    """
+                    INSERT INTO agreed_specs (
+                        spec_id, lab_id, topic_session_id, work_type, agreed_title,
+                        agreed_description, acceptance_criteria_json, generated_from_json,
+                        status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        spec_id,
+                        lab_id,
+                        topic_session_id,
+                        work_type,
+                        agreed_title,
+                        agreed_description,
+                        dumps_json(acceptance_criteria),
+                        dumps_json(generated_from),
+                        status,
+                        now,
+                        now,
+                    ),
+                )
+
+            conn.execute(
+                """
+                UPDATE labs
+                SET agreed_spec_id = ?, work_type = ?, title = ?, description = ?, status = ?, updated_at = ?
+                WHERE lab_id = ?;
+                """,
+                (
+                    spec_id,
+                    work_type,
+                    agreed_title,
+                    agreed_description,
+                    STATUS_FINALIZED,
+                    now,
+                    lab_id,
+                ),
+            )
+
+            row = conn.execute("SELECT * FROM agreed_specs WHERE spec_id = ?;", (spec_id,)).fetchone()
+            return self._decode_agreed_spec(row_to_dict(row))
+
+    def get_agreed_spec(self, spec_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM agreed_specs WHERE spec_id = ?;", (spec_id,)).fetchone()
+            return self._decode_agreed_spec(row_to_dict(row))
+
+    def get_agreed_spec_by_lab(self, lab_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM agreed_specs
+                WHERE lab_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1;
+                """,
+                (lab_id,),
+            ).fetchone()
+            return self._decode_agreed_spec(row_to_dict(row))
+
+    # Submissions
+
+    def create_submission(
+            self,
+            *,
+            lab_id: str,
+            student_name: str = "",
+            title: str = "",
+            description: str = "",
+            file_bundle: Optional[dict[str, Any]] = None,
+            analysis: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         submission_id = new_id("sub")
-        created = now_iso()
-        safe_name = _safe_filename(filename)
-        orig_path = self._submissions_dir(lab_id) / f"{submission_id}_{safe_name}"
-        text_path = self._extracts_dir(lab_id) / "submissions" / f"{submission_id}.txt"
+        now = utc_now()
 
-        _atomic_write_bytes(orig_path, data)
-        _atomic_write_text(text_path, extracted_text or "", encoding="utf-8")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO submissions (
+                    submission_id, lab_id, student_name, title, description,
+                    file_bundle_json, analysis_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    submission_id,
+                    lab_id,
+                    student_name,
+                    title,
+                    description,
+                    dumps_json(file_bundle),
+                    dumps_json(analysis),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM submissions WHERE submission_id = ?;", (submission_id,)).fetchone()
+            return self._decode_submission(row_to_dict(row))
 
-        m = meta or {}
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO submissions(submission_id,lab_id,student_id,filename,mime,original_path,extracted_text_path,meta_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?);
-            """, (
-                submission_id, lab_id, student_id, safe_name, mime,
-                str(orig_path), str(text_path), _json_dumps(m), created
-            ))
-        return self.get_submission(submission_id)
+    def update_submission(
+            self,
+            submission_id: str,
+            *,
+            student_name: Optional[str] = None,
+            title: Optional[str] = None,
+            description: Optional[str] = None,
+            file_bundle: Optional[dict[str, Any]] = None,
+            analysis: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        current = self.get_submission(submission_id)
+        if not current:
+            return None
 
-    def get_submission(self, submission_id: str) -> Submission:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM submissions WHERE submission_id=?;", (submission_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"Submission not found: {submission_id}")
-        return self._row_to_submission(row)
+        merged_file_bundle = current["file_bundle_json"]
+        if file_bundle is not None:
+            merged = dict(merged_file_bundle)
+            merged.update(file_bundle)
+            merged_file_bundle = merged
 
-    def list_submissions(self, lab_id: str) -> List[Submission]:
-        with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT * FROM submissions WHERE lab_id=? ORDER BY created_at DESC;
-            """, (lab_id,)).fetchall()
-        return [self._row_to_submission(r) for r in rows]
+        merged_analysis = current["analysis_json"]
+        if analysis is not None:
+            merged = dict(merged_analysis)
+            merged.update(analysis)
+            merged_analysis = merged
 
-    # Defense sessions
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE submissions
+                SET
+                    student_name = ?,
+                    title = ?,
+                    description = ?,
+                    file_bundle_json = ?,
+                    analysis_json = ?,
+                    updated_at = ?
+                WHERE submission_id = ?;
+                """,
+                (
+                    student_name if student_name is not None else current["student_name"],
+                    title if title is not None else current["title"],
+                    description if description is not None else current["description"],
+                    dumps_json(merged_file_bundle),
+                    dumps_json(merged_analysis),
+                    now,
+                    submission_id,
+                ),
+            )
+            row = conn.execute("SELECT * FROM submissions WHERE submission_id = ?;", (submission_id,)).fetchone()
+            return self._decode_submission(row_to_dict(row))
+
+    def get_submission(self, submission_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM submissions WHERE submission_id = ?;", (submission_id,)).fetchone()
+            return self._decode_submission(row_to_dict(row))
+
+    def list_submissions(self, lab_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM submissions
+                WHERE lab_id = ?
+                ORDER BY created_at DESC;
+                """,
+                (lab_id,),
+            ).fetchall()
+            return [self._decode_submission(item) for item in rows_to_dicts(rows)]
+
+    # Defense
 
     def create_defense_session(
             self,
+            *,
             lab_id: str,
-            submission_id: str,
-            *,
-            student_label: str = "student",
-            policy_version: Optional[int] = None
-    ) -> DefenseSession:
-        """Start a defense session."""
-        lab = self.get_lab(lab_id)
-        _ = self.get_submission(submission_id)
+            submission_id: Optional[str] = None,
+            status: str = STATUS_DRAFT,
+            plan: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        defense_session_id = new_id("def")
+        now = utc_now()
 
-        sess_id = new_id("sess")
-        started = now_iso()
-        ver = int(policy_version if policy_version is not None else lab.published_version)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO defense_sessions (
+                    defense_session_id, lab_id, submission_id, status,
+                    plan_json, summary_json, score_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, '{}', '{}', ?, ?);
+                """,
+                (
+                    defense_session_id,
+                    lab_id,
+                    submission_id,
+                    status,
+                    dumps_json(plan),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM defense_sessions WHERE defense_session_id = ?;",
+                (defense_session_id,),
+            ).fetchone()
+            return self._decode_defense_session(row_to_dict(row))
 
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO defense_sessions(session_id,lab_id,submission_id,student_label,status,started_at,policy_version,system_summary_json,teacher_summary_json)
-                VALUES(?,?,?,?,? ,?,?,?,?);
-            """, (sess_id, lab_id, submission_id, student_label, "in_progress", started, ver, "{}", "{}"))
-        return self.get_defense_session(sess_id)
+    def get_defense_session(self, defense_session_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM defense_sessions WHERE defense_session_id = ?;",
+                (defense_session_id,),
+            ).fetchone()
+            return self._decode_defense_session(row_to_dict(row))
 
-    def get_defense_session(self, session_id: str) -> DefenseSession:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM defense_sessions WHERE session_id=?;", (session_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"Defense session not found: {session_id}")
-        return self._row_to_session(row)
+    def list_defense_sessions(self, lab_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM defense_sessions
+                WHERE lab_id = ?
+                ORDER BY created_at DESC;
+                """,
+                (lab_id,),
+            ).fetchall()
+            return [self._decode_defense_session(item) for item in rows_to_dicts(rows)]
 
-    def finish_defense_session(self, session_id: str, *, system_summary: Optional[JsonDict] = None) -> None:
-        """Mark session finished and optionally store system summary JSON."""
-        finished = now_iso()
-        sys_sum = system_summary or {}
-        with self._tx() as conn:
-            conn.execute("""
-                UPDATE defense_sessions
-                SET status='finished', finished_at=?, system_summary_json=?
-                WHERE session_id=?;
-            """, (finished, _json_dumps(sys_sum), session_id))
-
-    def set_teacher_session_summary(self, session_id: str, teacher_summary: JsonDict) -> None:
-        with self._tx() as conn:
-            conn.execute("""
-                UPDATE defense_sessions SET teacher_summary_json=? WHERE session_id=?;
-            """, (_json_dumps(teacher_summary), session_id))
-
-    # Q/A turns
-
-    def append_question(self, session_id: str, question: JsonDict) -> str:
-        """Add a new question turn. Returns turn_id."""
-        created = now_iso()
-        turn_id = new_id("turn")
-        idx = self._next_turn_idx(session_id)
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO qa_turns(turn_id,session_id,idx,question_json,answer_text,answer_json,system_eval_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?);
-            """, (turn_id, session_id, idx, _json_dumps(question), "", "{}", "{}", created))
-        return turn_id
-
-    def submit_answer(
+    def update_defense_session(
             self,
-            turn_id: str,
-            answer_text: str,
+            defense_session_id: str,
             *,
-            answer_json: Optional[JsonDict] = None,
-            system_eval: Optional[JsonDict] = None
-    ) -> None:
-        """Attach student's answer + optional structured eval to an existing turn."""
-        ans_j = answer_json or {}
-        eval_j = system_eval or {}
-        with self._tx() as conn:
-            conn.execute("""
-                UPDATE qa_turns
-                SET answer_text=?, answer_json=?, system_eval_json=?
-                WHERE turn_id=?;
-            """, (answer_text or "", _json_dumps(ans_j), _json_dumps(eval_j), turn_id))
+            status: Optional[str] = None,
+            plan: Optional[dict[str, Any]] = None,
+            summary: Optional[dict[str, Any]] = None,
+            score: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        current = self.get_defense_session(defense_session_id)
+        if not current:
+            return None
 
-    def list_turns(self, session_id: str) -> List[JsonDict]:
-        """Return all turns as dicts (ready for building log)."""
-        with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT * FROM qa_turns WHERE session_id=? ORDER BY idx ASC;
-            """, (session_id,)).fetchall()
-        out: List[JsonDict] = []
-        for r in rows:
-            out.append({
-                "turn_id": r["turn_id"],
-                "idx": r["idx"],
-                "question": _json_loads(r["question_json"]) or {},
-                "answer_text": r["answer_text"] or "",
-                "answer": _json_loads(r["answer_json"]) or {},
-                "system_eval": _json_loads(r["system_eval_json"]) or {},
-                "created_at": r["created_at"],
-            })
-        return out
+        merged_plan = current["plan_json"]
+        if plan is not None:
+            merged = dict(merged_plan)
+            merged.update(plan)
+            merged_plan = merged
 
-    def _next_turn_idx(self, session_id: str) -> int:
-        with self._connect() as conn:
-            row = conn.execute("SELECT COALESCE(MAX(idx), -1) AS m FROM qa_turns WHERE session_id=?;",
-                               (session_id,)).fetchone()
-        return int(row["m"]) + 1
+        merged_summary = current["summary_json"]
+        if summary is not None:
+            merged = dict(merged_summary)
+            merged.update(summary)
+            merged_summary = merged
+
+        merged_score = current["score_json"]
+        if score is not None:
+            merged = dict(merged_score)
+            merged.update(score)
+            merged_score = merged
+
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE defense_sessions
+                SET
+                    status = ?,
+                    plan_json = ?,
+                    summary_json = ?,
+                    score_json = ?,
+                    updated_at = ?
+                WHERE defense_session_id = ?;
+                """,
+                (
+                    status if status is not None else current["status"],
+                    dumps_json(merged_plan),
+                    dumps_json(merged_summary),
+                    dumps_json(merged_score),
+                    now,
+                    defense_session_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM defense_sessions WHERE defense_session_id = ?;",
+                (defense_session_id,),
+            ).fetchone()
+            return self._decode_defense_session(row_to_dict(row))
+
+    def add_qa_turn(
+            self,
+            *,
+            defense_session_id: str,
+            question_text: str,
+            answer_text: str = "",
+            evaluation: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        qa_turn_id = new_id("qa")
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO qa_turns (
+                    qa_turn_id, defense_session_id, question_text,
+                    answer_text, evaluation_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    qa_turn_id,
+                    defense_session_id,
+                    question_text,
+                    answer_text,
+                    dumps_json(evaluation),
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM qa_turns WHERE qa_turn_id = ?;", (qa_turn_id,)).fetchone()
+            return self._decode_qa_turn(row_to_dict(row))
+
+    def list_qa_turns(self, defense_session_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM qa_turns
+                WHERE defense_session_id = ?
+                ORDER BY created_at ASC;
+                """,
+                (defense_session_id,),
+            ).fetchall()
+            return [self._decode_qa_turn(item) for item in rows_to_dicts(rows)]
 
     # Feedback
 
-    def add_student_feedback(
-            self,
-            session_id: str,
-            *,
-            rating: Optional[int] = None,
-            comment: str = "",
-            tags: Optional[List[str]] = None
-    ) -> str:
-        fid = new_id("sfb")
-        created = now_iso()
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO student_feedback(feedback_id,session_id,rating,comment,tags_json,created_at)
-                VALUES(?,?,?,?,?,?);
-            """, (fid, session_id, rating, comment or "", _json_dumps(tags or []), created))
-        return fid
-
     def add_teacher_feedback(
             self,
-            session_id: str,
             *,
-            target: str,  # 'question'|'answer'|'session'
-            label: str,  # 'good'|'bad'
-            turn_id: Optional[str] = None,
-            score: Optional[float] = None,
-            reason_tags: Optional[List[str]] = None,
-            comment: str = ""
-    ) -> str:
-        fid = new_id("tfb")
-        created = now_iso()
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO teacher_feedback(feedback_id,session_id,target,turn_id,label,score,reason_tags_json,comment,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?);
-            """, (
-            fid, session_id, target, turn_id, label, score, _json_dumps(reason_tags or []), comment or "", created))
-        return fid
+            lab_id: str,
+            feedback_text: str,
+            defense_session_id: Optional[str] = None,
+            extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        teacher_feedback_id = new_id("tfb")
+        now = utc_now()
 
-    # Policy items (teacher preference memory)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO teacher_feedback (
+                    teacher_feedback_id, lab_id, defense_session_id,
+                    feedback_text, extra_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    teacher_feedback_id,
+                    lab_id,
+                    defense_session_id,
+                    feedback_text,
+                    dumps_json(extra),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM teacher_feedback WHERE teacher_feedback_id = ?;",
+                (teacher_feedback_id,),
+            ).fetchone()
+            return self._decode_feedback(row_to_dict(row))
+
+    def list_teacher_feedback(self, lab_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM teacher_feedback
+                WHERE lab_id = ?
+                ORDER BY created_at DESC;
+                """,
+                (lab_id,),
+            ).fetchall()
+            return [self._decode_feedback(item) for item in rows_to_dicts(rows)]
+
+    def add_student_feedback(
+            self,
+            *,
+            lab_id: str,
+            feedback_text: str,
+            defense_session_id: Optional[str] = None,
+            extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        student_feedback_id = new_id("sfb")
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO student_feedback (
+                    student_feedback_id, lab_id, defense_session_id,
+                    feedback_text, extra_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    student_feedback_id,
+                    lab_id,
+                    defense_session_id,
+                    feedback_text,
+                    dumps_json(extra),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM student_feedback WHERE student_feedback_id = ?;",
+                (student_feedback_id,),
+            ).fetchone()
+            return self._decode_feedback(row_to_dict(row))
+
+    def list_student_feedback(self, lab_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM student_feedback
+                WHERE lab_id = ?
+                ORDER BY created_at DESC;
+                """,
+                (lab_id,),
+            ).fetchall()
+            return [self._decode_feedback(item) for item in rows_to_dicts(rows)]
+
+    # Policy memory
 
     def add_policy_item(
             self,
-            lab_id: str,
             *,
-            kind: str,
-            content: JsonDict,
-            reason_tags: Optional[List[str]] = None,
-            source_feedback_id: Optional[str] = None
-    ) -> str:
-        item_id = new_id("pol")
-        created = now_iso()
-        with self._tx() as conn:
-            conn.execute("""
-                INSERT INTO policy_items(item_id,lab_id,kind,content_json,reason_tags_json,source_feedback_id,created_at)
-                VALUES(?,?,?,?,?,?,?);
-            """, (
-            item_id, lab_id, kind, _json_dumps(content), _json_dumps(reason_tags or []), source_feedback_id, created))
-        return item_id
+            title: str,
+            body_text: str,
+            kind: str = "general",
+            lab_id: Optional[str] = None,
+            score: Optional[float] = None,
+            source: str = "teacher_feedback",
+            meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        policy_item_id = new_id("pol")
+        now = utc_now()
 
-    def list_policy_items(self, lab_id: str, *, kind: Optional[str] = None, limit: int = 100) -> List[JsonDict]:
-        with self._connect() as conn:
-            if kind:
-                rows = conn.execute("""
-                    SELECT * FROM policy_items WHERE lab_id=? AND kind=? ORDER BY created_at DESC LIMIT ?;
-                """, (lab_id, kind, limit)).fetchall()
-            else:
-                rows = conn.execute("""
-                    SELECT * FROM policy_items WHERE lab_id=? ORDER BY created_at DESC LIMIT ?;
-                """, (lab_id, limit)).fetchall()
-        out: List[JsonDict] = []
-        for r in rows:
-            out.append({
-                "item_id": r["item_id"],
-                "lab_id": r["lab_id"],
-                "kind": r["kind"],
-                "content": _json_loads(r["content_json"]) or {},
-                "reason_tags": _json_loads(r["reason_tags_json"]) or [],
-                "source_feedback_id": r["source_feedback_id"],
-                "created_at": r["created_at"],
-            })
-        return out
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO policy_items (
+                    policy_item_id, lab_id, kind, title, body_text,
+                    score, source, meta_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    policy_item_id,
+                    lab_id,
+                    kind,
+                    title,
+                    body_text,
+                    score,
+                    source,
+                    dumps_json(meta),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM policy_items WHERE policy_item_id = ?;",
+                (policy_item_id,),
+            ).fetchone()
+            return self._decode_policy_item(row_to_dict(row))
 
-    def get_policy_examples(
+    def list_policy_items(
             self,
-            lab_id: str,
             *,
-            good_kind: str = "good_question",
-            bad_kind: str = "bad_question",
-            good_limit: int = 8,
-            bad_limit: int = 6
-    ) -> Tuple[List[JsonDict], List[JsonDict]]:
+            lab_id: Optional[str] = None,
+            kind: Optional[str] = None,
+            limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+
+        if lab_id is not None:
+            where.append("lab_id = ?")
+            params.append(lab_id)
+
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM policy_items
+                {where_sql}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?;
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [self._decode_policy_item(item) for item in rows_to_dicts(rows)]
+
+    # High-level helpers for new flow
+
+    def create_assignment_with_topic_session(
+            self,
+            *,
+            teacher_title: str,
+            teacher_description: str = "",
+            work_type: str = WORK_TYPE_OTHER,
+            config: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         """
-        Вернёт (good_examples, bad_examples) для few-shot/RAG.
-        Здесь без embeddings: просто последние записи.
+        Удобный helper:
+        1) создает lab,
+        2) сразу создает topic_session.
         """
-        good = self.list_policy_items(lab_id, kind=good_kind, limit=good_limit)
-        bad = self.list_policy_items(lab_id, kind=bad_kind, limit=bad_limit)
-        return good, bad
-
-    # Logs / export
-
-    def build_defense_log(self, session_id: str) -> JsonDict:
-        """Assemble full defense log (submission + turns + summaries + feedback references)."""
-        sess = self.get_defense_session(session_id)
-        sub = self.get_submission(sess.submission_id)
-        turns = self.list_turns(session_id)
-
-        with self._connect() as conn:
-            sfb = conn.execute("SELECT * FROM student_feedback WHERE session_id=? ORDER BY created_at ASC;",
-                               (session_id,)).fetchall()
-            tfb = conn.execute("SELECT * FROM teacher_feedback WHERE session_id=? ORDER BY created_at ASC;",
-                               (session_id,)).fetchall()
-
-        student_feedback = [{
-            "feedback_id": r["feedback_id"],
-            "rating": r["rating"],
-            "comment": r["comment"],
-            "tags": _json_loads(r["tags_json"]) or [],
-            "created_at": r["created_at"],
-        } for r in sfb]
-
-        teacher_feedback = [{
-            "feedback_id": r["feedback_id"],
-            "target": r["target"],
-            "turn_id": r["turn_id"],
-            "label": r["label"],
-            "score": r["score"],
-            "reason_tags": _json_loads(r["reason_tags_json"]) or [],
-            "comment": r["comment"],
-            "created_at": r["created_at"],
-        } for r in tfb]
-
+        lab = self.create_lab(
+            title=teacher_title or "Новое задание",
+            description=teacher_description,
+            work_type=work_type,
+            status=STATUS_DRAFT,
+            config=config,
+        )
+        topic_session = self.create_topic_session(lab_id=lab["lab_id"], status=STATUS_DRAFT)
+        lab = self.update_lab(lab["lab_id"], config={"topic_session_id": topic_session["topic_session_id"]})
         return {
-            "session": {
-                "session_id": sess.session_id,
-                "lab_id": sess.lab_id,
-                "submission_id": sess.submission_id,
-                "student_label": sess.student_label,
-                "status": sess.status,
-                "started_at": sess.started_at,
-                "finished_at": sess.finished_at,
-                "policy_version": sess.policy_version,
-                "system_summary": sess.system_summary,
-                "teacher_summary": sess.teacher_summary,
-            },
-            "submission": {
-                "submission_id": sub.submission_id,
-                "filename": sub.filename,
-                "mime": sub.mime,
-                "student_id": sub.student_id,
-                "original_path": sub.original_path,
-                "extracted_text_path": sub.extracted_text_path,
-                "meta": sub.meta,
-                "created_at": sub.created_at,
-            },
-            "turns": turns,
-            "student_feedback": student_feedback,
-            "teacher_feedback": teacher_feedback,
+            "lab": lab,
+            "topic_session": topic_session,
         }
 
-    def export_defense_log_json(self, session_id: str, *, filename: Optional[str] = None) -> Path:
-        """Export defense log to lab exports folder and return path."""
-        sess = self.get_defense_session(session_id)
-        log = self.build_defense_log(session_id)
-        name = filename or f"defense_log_{session_id}.json"
-        safe_name = _safe_filename(name)
-        out_path = self._exports_dir(sess.lab_id) / safe_name
-        _atomic_write_text(out_path, _json_dumps(log), encoding="utf-8")
-        return out_path
-
-    # Row mappers
-
-    def _row_to_lab(self, r: sqlite3.Row) -> Lab:
-        return Lab(
-            lab_id=r["lab_id"],
-            title=r["title"],
-            status=r["status"],
-            config=_json_loads(r["config_json"]) or {},
-            created_at=r["created_at"],
-            updated_at=r["updated_at"],
-            published_version=int(r["published_version"]),
+    def finalize_assignment_from_agreed_spec(
+            self,
+            *,
+            lab_id: str,
+            topic_session_id: Optional[str],
+            work_type: str,
+            agreed_title: str,
+            agreed_description: str,
+            acceptance_criteria: Optional[dict[str, Any]] = None,
+            generated_from: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        spec = self.save_agreed_spec(
+            lab_id=lab_id,
+            topic_session_id=topic_session_id,
+            work_type=work_type,
+            agreed_title=agreed_title,
+            agreed_description=agreed_description,
+            acceptance_criteria=acceptance_criteria,
+            generated_from=generated_from,
+            status=STATUS_FINALIZED,
         )
 
-    def _row_to_material(self, r: sqlite3.Row) -> Material:
-        return Material(
-            material_id=r["material_id"],
-            lab_id=r["lab_id"],
-            kind=r["kind"],
-            filename=r["filename"],
-            mime=r["mime"],
-            original_path=r["original_path"],
-            extracted_text_path=r["extracted_text_path"],
-            meta=_json_loads(r["meta_json"]) or {},
-            created_at=r["created_at"],
+        if topic_session_id:
+            self.update_topic_session(
+                topic_session_id,
+                status=STATUS_FINALIZED,
+                summary_text="Согласованная тема зафиксирована.",
+            )
+
+        lab = self.update_lab(
+            lab_id,
+            title=agreed_title,
+            description=agreed_description,
+            work_type=work_type,
+            status=STATUS_FINALIZED,
+            agreed_spec_id=spec["spec_id"],
+            config={"assignment_ready": True},
         )
 
-    def _row_to_submission(self, r: sqlite3.Row) -> Submission:
-        return Submission(
-            submission_id=r["submission_id"],
-            lab_id=r["lab_id"],
-            student_id=r["student_id"],
-            filename=r["filename"],
-            mime=r["mime"],
-            original_path=r["original_path"],
-            extracted_text_path=r["extracted_text_path"],
-            meta=_json_loads(r["meta_json"]) or {},
-            created_at=r["created_at"],
-        )
+        return {
+            "lab": lab,
+            "agreed_spec": spec,
+        }
 
-    def _row_to_session(self, r: sqlite3.Row) -> DefenseSession:
-        return DefenseSession(
-            session_id=r["session_id"],
-            lab_id=r["lab_id"],
-            submission_id=r["submission_id"],
-            student_label=r["student_label"],
-            status=r["status"],
-            started_at=r["started_at"],
-            finished_at=r["finished_at"],
-            policy_version=int(r["policy_version"]),
-            system_summary=_json_loads(r["system_summary_json"]) or {},
-            teacher_summary=_json_loads(r["teacher_summary_json"]) or {},
-        )
+    # Decode helpers
+
+    def _decode_lab(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["config_json"] = loads_json(item.get("config_json"), default={})
+        return item
+
+    def _decode_material(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["meta_json"] = loads_json(item.get("meta_json"), default={})
+        return item
+
+    def _decode_topic_session(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["llm_assessment_json"] = loads_json(item.get("llm_assessment_json"), default={})
+        return item
+
+    def _decode_topic_input(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["context_json"] = loads_json(item.get("context_json"), default={})
+        return item
+
+    def _decode_topic_turn(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["extra_json"] = loads_json(item.get("extra_json"), default={})
+        return item
+
+    def _decode_agreed_spec(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["acceptance_criteria_json"] = loads_json(item.get("acceptance_criteria_json"), default={})
+        item["generated_from_json"] = loads_json(item.get("generated_from_json"), default={})
+        return item
+
+    def _decode_submission(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["file_bundle_json"] = loads_json(item.get("file_bundle_json"), default={})
+        item["analysis_json"] = loads_json(item.get("analysis_json"), default={})
+        return item
+
+    def _decode_defense_session(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["plan_json"] = loads_json(item.get("plan_json"), default={})
+        item["summary_json"] = loads_json(item.get("summary_json"), default={})
+        item["score_json"] = loads_json(item.get("score_json"), default={})
+        return item
+
+    def _decode_qa_turn(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["evaluation_json"] = loads_json(item.get("evaluation_json"), default={})
+        return item
+
+    def _decode_feedback(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["extra_json"] = loads_json(item.get("extra_json"), default={})
+        return item
+
+    def _decode_policy_item(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["meta_json"] = loads_json(item.get("meta_json"), default={})
+        return item
 
 
-# Default config (editable in UI)
+# Factory
 
 
-def default_lab_config() -> JsonDict:
-    """
-    Базовые параметры для формализации сценария:
-    - числа вопросов по уровням сложности
-    - циклы калибровки
-    - требуемые разделы отчёта
-    """
-    return {
-        "question_plan": {"easy": 3, "medium": 2, "hard": 1},
-        "max_calibration_rounds": 5,
-        "min_teacher_approval_rate": 0.8,
-        "max_followups_per_question": 1,
-        "required_sections": [
-            "Цель и постановка задачи",
-            "Теория",
-            "Ход выполнения",
-            "Результаты",
-            "Выводы",
-            "Список источников",
-        ],
-        "strictness": 0.7,
-        "allowed_sources": "materials_only",  # materials_only | open_knowledge
-        "grading_mode": "draft",  # draft | teacher_only
-    }
+def create_storage(db_path: str | Path) -> Storage:
+    storage = Storage(db_path)
+    storage.init_db()
+    return storage
+
+
+# Manual smoke test
+
+
+if __name__ == "__main__":
+    db = create_storage("data/app.sqlite3")
+
+    bundle = db.create_assignment_with_topic_session(
+        teacher_title="Тестовое задание",
+        teacher_description="Проверка нового контура согласования темы",
+        work_type=WORK_TYPE_RESEARCH,
+        config={"topic_alignment_enabled": True},
+    )
+
+    lab = bundle["lab"]
+    topic_session = bundle["topic_session"]
+
+    db.upsert_topic_input(
+        topic_session_id=topic_session["topic_session_id"],
+        side=SIDE_STUDENT,
+        title="Анализ документов организации",
+        description="Интересует задача обработки внутренних документов и отчетности",
+        context={"origin": "practice"},
+    )
+
+    db.upsert_topic_input(
+        topic_session_id=topic_session["topic_session_id"],
+        side=SIDE_TEACHER,
+        title="Методы обработки текстовых данных в рамках дисциплины",
+        description="Нужно, чтобы тема проверялась в пределах дисциплины",
+        context={"discipline": "ИИ в образовании"},
+    )
+
+    db.add_material(
+        lab_id=lab["lab_id"],
+        filename="teacher_notes.pdf",
+        owner_role=MATERIAL_ROLE_TEACHER,
+        stage=MATERIAL_STAGE_TOPIC_ALIGNMENT,
+        title="Материалы преподавателя",
+        file_path="uploads/teacher_notes.pdf",
+    )
+
+    db.add_topic_turn(
+        topic_session_id=topic_session["topic_session_id"],
+        side=SIDE_TEACHER,
+        turn_kind="question",
+        question_text="Какие именно типы документов студент хочет анализировать?",
+    )
+
+    db.update_topic_session(
+        topic_session["topic_session_id"],
+        status=STATUS_NEEDS_CLARIFICATION,
+        round_no=1,
+        relation_score=0.46,
+        relation_label="weak",
+        summary_text="Есть частичное пересечение, но нужны уточнения.",
+        llm_assessment={
+            "overlap_points": ["обработка документов", "анализ содержания"],
+            "conflicts": ["не заданы границы результата"],
+        },
+    )
+
+    result = db.finalize_assignment_from_agreed_spec(
+        lab_id=lab["lab_id"],
+        topic_session_id=topic_session["topic_session_id"],
+        work_type=WORK_TYPE_RESEARCH,
+        agreed_title="Исследование методов автоматизированного анализа учебных и организационных документов",
+        agreed_description="Студент выполняет исследовательское задание в рамках дисциплины с опорой на обработку текстовых данных.",
+        acceptance_criteria={
+            "deliverables": ["описание предметной области", "прототип", "отчет"],
+            "evaluation_axes": ["корректность", "обоснованность", "соответствие дисциплине"],
+        },
+        generated_from={"source": "llm_alignment"},
+    )
+
+    print("LAB:")
+    print(result["lab"])
+    print("\nSPEC:")
+    print(result["agreed_spec"])

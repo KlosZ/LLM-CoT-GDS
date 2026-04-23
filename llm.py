@@ -2,13 +2,7 @@
 Единый клиент для вызова LLM (OpenAI-compatible) из вашего приложения.
 
 Особенности:
-- Читает настройки из .env / окружения:
-    OPENAI_API_KEY        (обязательно)
-    OPENAI_BASE_URL       (опционально, по умолчанию https://api.openai.com/v1)
-    MODEL_NAME            (опционально)
-    LLM_TEMPERATURE       (опционально)
-    LLM_MAX_TOKENS        (опционально)
-    LLM_TIMEOUT_SECONDS   (опционально)
+- Читает настройки из .env / окружения
 - Работает в 2 режимах:
     1) Через python-библиотеку openai (если установлена)
     2) Через прямой HTTP (urllib из stdlib), если openai не установлена
@@ -19,15 +13,22 @@
 
 from __future__ import annotations
 
-import json
 import ast
+import json
 import os
 import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
 
 JsonDict = Dict[str, Any]
 
@@ -76,7 +77,7 @@ class LLMConfig:
         if not api_key:
             raise LLMAuthError(
                 "OPENAI_API_KEY is missing. Put it in your .env and load it, "
-                "or set as an environment variable."
+                "or set it as an environment variable."
             )
 
         base_url = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
@@ -105,7 +106,252 @@ class LLMResponse:
     latency_ms: int
 
 
-# Public API
+# Schema registry
+
+
+def _schema_str() -> JsonDict:
+    return {"type": "string"}
+
+
+def _schema_num() -> JsonDict:
+    return {"type": "number"}
+
+
+def _schema_bool() -> JsonDict:
+    return {"type": "boolean"}
+
+
+def _schema_array(item_schema: Optional[JsonDict] = None) -> JsonDict:
+    return {
+        "type": "array",
+        "items": item_schema or {"type": "string"},
+    }
+
+
+def _schema_obj(properties: JsonDict, required: Optional[List[str]] = None) -> JsonDict:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required or list(properties.keys()),
+        "additionalProperties": True,
+    }
+
+
+SCHEMA_REGISTRY: Dict[str, JsonDict] = {
+    "topic_relation_assessment": _schema_obj(
+        {
+            "relation_score": _schema_num(),
+            "relation_label": _schema_str(),
+            "needs_clarification": _schema_bool(),
+            "overlap_points": _schema_array(_schema_str()),
+            "conflicts": _schema_array(_schema_str()),
+            "short_reason": _schema_str(),
+        }
+    ),
+    "clarification_questions": _schema_obj(
+        {
+            "student_questions": _schema_array(_schema_str()),
+            "teacher_questions": _schema_array(_schema_str()),
+            "rationale": _schema_str(),
+        }
+    ),
+    "agreed_assignment_spec": _schema_obj(
+        {
+            "work_type": _schema_str(),
+            "agreed_title": _schema_str(),
+            "agreed_description": _schema_str(),
+            "acceptance_criteria": _schema_obj(
+                {
+                    "must_have": _schema_array(_schema_str()),
+                    "deliverables": _schema_array(_schema_str()),
+                    "evaluation_axes": _schema_array(_schema_str()),
+                }
+            ),
+        }
+    ),
+    "methodics_artifact": _schema_obj(
+        {
+            "title": _schema_str(),
+            "body_text": _schema_str(),
+            "checklist": _schema_array(_schema_str()),
+        }
+    ),
+    "submission_analysis": _schema_obj(
+        {
+            "summary": _schema_str(),
+            "strengths": _schema_array(_schema_str()),
+            "risks": _schema_array(_schema_str()),
+            "recommended_focus": _schema_array(_schema_str()),
+        }
+    ),
+    "question_pool": _schema_obj(
+        {
+            "questions": _schema_array(_schema_str()),
+            "strategy_note": _schema_str(),
+        }
+    ),
+    "answer_evaluation": _schema_obj(
+        {
+            "score": _schema_num(),
+            "verdict": _schema_str(),
+            "strengths": _schema_array(_schema_str()),
+            "weaknesses": _schema_array(_schema_str()),
+            "follow_up": _schema_str(),
+        }
+    ),
+    "student_feedback": _schema_obj(
+        {
+            "feedback_text": _schema_str(),
+            "highlights": _schema_array(_schema_str()),
+        }
+    ),
+    "policy_update": _schema_obj(
+        {
+            "items": {
+                "type": "array",
+                "items": _schema_obj(
+                    {
+                        "kind": _schema_str(),
+                        "title": _schema_str(),
+                        "body_text": _schema_str(),
+                    }
+                ),
+            },
+        }
+    ),
+}
+
+
+def get_json_schema(schema_name: Optional[str]) -> Optional[JsonDict]:
+    if not schema_name:
+        return None
+    return SCHEMA_REGISTRY.get(schema_name)
+
+
+# Public high-level client
+
+
+class LLMClient:
+    def __init__(self, config: Optional[LLMConfig] = None) -> None:
+        self.config = config or LLMConfig.from_env()
+
+    def generate(
+            self,
+            *,
+            user_prompt: Optional[str] = None,
+            system_prompt: Optional[str] = None,
+            messages: Optional[List[JsonDict]] = None,
+            json_schema: Optional[JsonDict] = None,
+            schema_name: Optional[str] = None,
+            strict_json: bool = True,
+    ) -> LLMResponse:
+        resolved_schema = json_schema or get_json_schema(schema_name)
+        return call_llm(
+            user_prompt or "",
+            system_prompt=system_prompt,
+            messages=messages,
+            json_schema=resolved_schema,
+            schema_name=schema_name or "output",
+            strict_json=strict_json,
+            config=self.config,
+        )
+
+    def generate_text(
+            self,
+            *,
+            user_prompt: Optional[str] = None,
+            system_prompt: Optional[str] = None,
+            messages: Optional[List[JsonDict]] = None,
+    ) -> str:
+        response = self.generate(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            json_schema=None,
+            schema_name=None,
+        )
+        return response.text
+
+    def generate_json(
+            self,
+            *,
+            user_prompt: Optional[str] = None,
+            system_prompt: Optional[str] = None,
+            messages: Optional[List[JsonDict]] = None,
+            json_schema: Optional[JsonDict] = None,
+            schema_name: Optional[str] = None,
+            strict_json: bool = True,
+    ) -> JsonDict:
+        response = self.generate(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            json_schema=json_schema,
+            schema_name=schema_name,
+            strict_json=strict_json,
+        )
+        if response.json is None:
+            parsed = _parse_json_best_effort(response.text)
+            if isinstance(parsed, dict):
+                return parsed
+            raise LLMOutputParseError("Structured JSON response was expected but not parsed.")
+        return response.json
+
+    def complete_json(self, **kwargs: Any) -> JsonDict:
+        return self.generate_json(**kwargs)
+
+    def invoke_json(self, **kwargs: Any) -> JsonDict:
+        return self.generate_json(**kwargs)
+
+    def chat_json(self, **kwargs: Any) -> JsonDict:
+        return self.generate_json(**kwargs)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        schema_name = kwargs.get("schema_name")
+        json_schema = kwargs.get("json_schema")
+        if schema_name or json_schema:
+            return self.generate_json(**kwargs)
+        return self.generate_text(**kwargs)
+
+
+def create_llm_client(config: Optional[LLMConfig] = None) -> LLMClient:
+    return LLMClient(config=config)
+
+
+def build_llm_client(config: Optional[LLMConfig] = None) -> LLMClient:
+    return create_llm_client(config=config)
+
+
+def get_llm_client(config: Optional[LLMConfig] = None) -> LLMClient:
+    return create_llm_client(config=config)
+
+
+def call_llm_json(
+        user_prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        messages: Optional[List[JsonDict]] = None,
+        json_schema: Optional[JsonDict] = None,
+        schema_name: Optional[str] = None,
+        strict_json: bool = True,
+        config: Optional[LLMConfig] = None,
+) -> JsonDict:
+    schema = json_schema or get_json_schema(schema_name)
+    response = call_llm(
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        messages=messages,
+        json_schema=schema,
+        schema_name=schema_name or "output",
+        strict_json=strict_json,
+        config=config,
+    )
+    if response.json is None:
+        raise LLMOutputParseError("JSON response was expected but was not parsed.")
+    return response.json
+
+
+# Public low-level API
 
 
 def call_llm(
@@ -145,18 +391,19 @@ def call_llm(
 
     t0 = time.time()
 
-    # 1) Try OpenAI python library (if installed)
+    # 1) Пробуем использовать OpenAI-библиотеку (если установлена)
     try:
         resp_raw = _call_with_openai_lib(
-            cfg, msgs,
+            cfg,
+            msgs,
             json_schema=json_schema,
             schema_name=schema_name,
-            strict_json=strict_json
+            strict_json=strict_json,
         )
         latency_ms = int((time.time() - t0) * 1000)
         return _normalize_response(resp_raw, cfg.model, latency_ms, json_schema=json_schema)
     except ModuleNotFoundError:
-        # openai library not installed -> fallback to HTTP
+        # OpenAI-библиотека не установлена -> используем HTTP-фоллбек
         pass
     except Exception as e:
         # Если библиотека есть, но упала из-за несовместимости response_format,
@@ -169,10 +416,11 @@ def call_llm(
 
     # 2) HTTP fallback
     resp_raw = _call_with_http(
-        cfg, msgs,
+        cfg,
+        msgs,
         json_schema=json_schema,
         schema_name=schema_name,
-        strict_json=strict_json
+        strict_json=strict_json,
     )
     latency_ms = int((time.time() - t0) * 1000)
     return _normalize_response(resp_raw, cfg.model, latency_ms, json_schema=json_schema)
@@ -195,7 +443,7 @@ def _inject_json_instructions(messages: List[JsonDict], *, json_schema: JsonDict
     """
     schema_text = json.dumps(json_schema, ensure_ascii=False)
     instr = (
-        "Верни результат СТРОГО как один JSON-объект без пояснений, без markdown-кодов.\n"
+        "Верни результат СТРОГО как один JSON-объект без пояснений и без markdown-кодов.\n"
         f"JSON должен соответствовать схеме: {schema_text}\n"
     )
     if strict:
@@ -219,14 +467,12 @@ def _call_with_openai_lib(
         *,
         json_schema: Optional[JsonDict],
         schema_name: str,
-        strict_json: bool
+        strict_json: bool,
 ) -> JsonDict:
     """
-    Uses openai python library if installed (OpenAI-compatible).
-    Supports base_url proxies.
+    Использует OpenAI-библиотеку, если она установлена.
+    Поддерживает прокси-серверы base_url.
     """
-    # OpenAI may exist under different import paths depending on version.
-    # Primary: from openai import OpenAI
     try:
         from openai import OpenAI  # type: ignore
     except ModuleNotFoundError as e:
@@ -241,10 +487,10 @@ def _call_with_openai_lib(
         "max_tokens": cfg.max_tokens,
     }
 
-    # Try structured output if requested
+    # При необходимости используем структурированный вывод
     if json_schema is not None:
-        # Newer OpenAI-style: response_format={"type":"json_schema","json_schema":{...}}
-        # Some proxies/older servers may not support this -> will raise -> caller fallback.
+        # Более новый стиль OpenAI: response_format={"type":"json_schema","json_schema":{...}}
+        # Некоторые прокси/старые серверы могут не поддерживать это -> ошибка -> фоллбек.
         kwargs["response_format"] = {
             "type": "json_schema",
             "json_schema": {
@@ -256,11 +502,10 @@ def _call_with_openai_lib(
 
     try:
         resp = client.chat.completions.create(**kwargs)
-        # Convert to plain dict-like
         raw = resp.model_dump() if hasattr(resp, "model_dump") else json.loads(resp.json())
         return raw
     except Exception as e:
-        # Try softer JSON mode if schema format not supported
+        # Пробуем более менее строгий JSON, если формат схемы не поддерживается
         if json_schema is not None:
             try:
                 kwargs2 = dict(kwargs)
@@ -270,7 +515,6 @@ def _call_with_openai_lib(
                 return raw2
             except Exception:
                 pass
-        # Map common errors
         _raise_mapped_openai_error(e)
         raise
 
@@ -281,7 +525,6 @@ def _raise_mapped_openai_error(e: Exception) -> None:
         raise LLMAuthError(str(e))
     if "rate limit" in msg or "429" in msg:
         raise LLMRateLimitError(str(e))
-    # otherwise do nothing here
 
 
 # HTTP caller (urllib)
@@ -296,7 +539,7 @@ def _call_with_http(
         strict_json: bool
 ) -> JsonDict:
     """
-    Direct HTTP call to {base_url}/chat/completions (OpenAI-compatible).
+    Прямой HTTP-вызов к {base_url}/chat/completions (совместим с OpenAI).
     """
     url = cfg.base_url.rstrip("/") + "/chat/completions"
 
@@ -308,7 +551,7 @@ def _call_with_http(
     }
 
     if json_schema is not None:
-        # Try "json_schema" mode first (if server supports)
+        # Сначала пробуем через json_schema (если сервер его поддерживает)
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {
@@ -335,7 +578,7 @@ def _call_with_http(
             return json.loads(resp_body)
     except urllib.error.HTTPError as he:
         resp_body = he.read().decode("utf-8", errors="replace") if hasattr(he, "read") else ""
-        # If json_schema not supported, retry with json_object
+        # json_schema не поддерживается -> пробуем через json_object
         if json_schema is not None and he.code in (400, 422):
             try:
                 payload2 = dict(payload)
@@ -368,22 +611,28 @@ def _call_with_http(
 # Response normalization + JSON parsing
 
 
-def _normalize_response(raw: JsonDict, model: str, latency_ms: int, *, json_schema: Optional[JsonDict]) -> LLMResponse:
+def _normalize_response(
+        raw: JsonDict,
+        model: str,
+        latency_ms: int,
+        *,
+        json_schema: Optional[JsonDict]
+) -> LLMResponse:
     """
-    Normalize OpenAI-compatible response into LLMResponse.
+    Преобразует ответ, совместимый с OpenAI, в формат LLMResponse.
     """
     text = _extract_text(raw)
     parsed: Optional[JsonDict] = None
 
     if json_schema is not None:
-        # Try direct JSON parse
+        # Пробуем прямой JSON-парсинг
         parsed = _parse_json_best_effort(text)
         if parsed is None:
-            # Sometimes model returns JSON in a tool-like field; attempt to find it
+            # Иногда модель возвращает JSON в виде нетипичного поля; пробуем его парсить
             parsed = _parse_json_from_raw(raw)
         if parsed is None:
             raise LLMOutputParseError(
-                "Model was asked to return JSON, but output could not be parsed as JSON."
+                "Модель должна была возвращать JSON, но выходные данные не удалось обработать как JSON."
             )
 
     return LLMResponse(
@@ -404,11 +653,25 @@ def _extract_text(raw: JsonDict) -> str:
         choices = raw.get("choices") or []
         if not choices:
             return ""
+
         msg = choices[0].get("message") or {}
         content = msg.get("content")
+
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(str(item.get("text", "")))
+                    elif "text" in item:
+                        parts.append(str(item.get("text", "")))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+
         if content is None:
-            # Some providers may use "text"
             content = msg.get("text", "")
+
         return str(content or "").strip()
     except Exception:
         return ""
@@ -416,10 +679,11 @@ def _extract_text(raw: JsonDict) -> str:
 
 def _parse_json_from_raw(raw: JsonDict) -> Optional[JsonDict]:
     """
-    Some providers put structured outputs elsewhere. Attempt a few known patterns.
+    Некоторые поставщики размещают структурированные результаты в другом месте.
+    Пробуем несколько известных шаблонов.
     """
-    # 1) message.content as string already handled
-    # 2) message.tool_calls[].function.arguments (OpenAI function calling style)
+    # 1) message.content как строка уже обработана
+    # 2) message.tool_calls[].function.arguments (стиль вызова функций OpenAI)
     try:
         choices = raw.get("choices") or []
         if not choices:
@@ -438,7 +702,7 @@ def _parse_json_from_raw(raw: JsonDict) -> Optional[JsonDict]:
     except Exception:
         pass
 
-    # 3) Some servers return {"output": {...}}
+    # 3) Иногда возвращается {"output": {...}}
     out = raw.get("output")
     if isinstance(out, dict):
         return out
@@ -448,29 +712,29 @@ def _parse_json_from_raw(raw: JsonDict) -> Optional[JsonDict]:
 
 def _parse_json_best_effort(text: str) -> Optional[JsonDict]:
     """
-    Parse JSON object from text.
-    - Accepts pure JSON
-    - Accepts JSON wrapped in markdown fences
-    - Accepts extra text: tries to extract first {...} block
-    - Accepts python-like dict via ast.literal_eval (single quotes, True/None)
+    Анализ JSON-объекта из текста.
+    - Принимает чистый JSON
+    - Принимает JSON, заключенный в блоки Markdown
+    - Принимает дополнительный текст: пытается извлечь первый блок {...}
+    - Принимает словарь, подобный Python, через ast.literal_eval (одинарные кавычки, True/None)
     """
     if not text:
         return None
 
     t = text.strip()
 
-    # Remove markdown fences if present
+    # Удаляем md-блоки, если есть
     t = re.sub(r"^\s*```(?:json)?\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*```\s*$", "", t)
 
-    # 1) direct json
+    # 1) чистый JSON
     try:
         obj = json.loads(t)
         return obj if isinstance(obj, dict) else None
     except Exception:
         pass
 
-    # 2) extract first {...} and try json
+    # 2) извлекаем первый {...} и пробуем JSON
     obj_str = _extract_first_json_object(t)
     if obj_str:
         try:
@@ -498,7 +762,7 @@ def _parse_json_best_effort(text: str) -> Optional[JsonDict]:
 
 def _extract_first_json_object(s: str) -> Optional[str]:
     """
-    Extract first {...} JSON object using brace counting (handles nested braces).
+    Извлекаем первый JSON-объект {...} с помощью подсчета фигурных скобок (обрабатывает вложенные скобки).
     """
     start = s.find("{")
     if start < 0:
@@ -528,7 +792,7 @@ def _extract_first_json_object(s: str) -> Optional[str]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return s[start: i + 1]
+                return s[start:i + 1]
 
     return None
 
@@ -554,3 +818,22 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).strip().replace(",", "."))
     except ValueError:
         return default
+
+
+__all__ = [
+    "LLMError",
+    "LLMAuthError",
+    "LLMRateLimitError",
+    "LLMHTTPError",
+    "LLMOutputParseError",
+    "LLMConfig",
+    "LLMResponse",
+    "LLMClient",
+    "SCHEMA_REGISTRY",
+    "get_json_schema",
+    "call_llm",
+    "call_llm_json",
+    "create_llm_client",
+    "build_llm_client",
+    "get_llm_client",
+]
