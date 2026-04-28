@@ -23,12 +23,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-try:
-    from dotenv import load_dotenv  # type: ignore
+from dotenv import load_dotenv  # type: ignore
 
-    load_dotenv()
-except Exception:
-    pass
+load_dotenv()
 
 JsonDict = Dict[str, Any]
 

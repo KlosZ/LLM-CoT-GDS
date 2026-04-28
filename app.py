@@ -5,13 +5,9 @@ import os
 from typing import Any, Optional
 
 import streamlit as st
+from dotenv import load_dotenv  # type: ignore
 
-try:
-    from dotenv import load_dotenv  # type: ignore
-
-    load_dotenv()
-except Exception:
-    pass
+load_dotenv()
 
 from core import ProjectCore, create_core
 from storage import (
