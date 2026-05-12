@@ -18,7 +18,11 @@ from storage import (
     MATERIAL_STAGE_TOPIC_ALIGNMENT,
     SIDE_STUDENT,
     SIDE_TEACHER,
+    STATUS_ALIGNED,
+    STATUS_DRAFT,
     STATUS_FINALIZED,
+    STATUS_NEEDS_CLARIFICATION,
+    STATUS_REJECTED,
     WORK_TYPE_OTHER,
     Storage,
     create_storage,
@@ -40,7 +44,22 @@ class ProjectCore:
     - прием работы студента
     - защита
     - обратная связь и policy memory
+
+    Важное исправление в этой версии:
+    этап согласования больше не отклоняет тему только из-за достижения
+    max_alignment_rounds, если последняя оценка связи уже уверенная.
+    Это защитный слой над TopicAlignmentAgent на случай, если внутри агента
+    проверка числа раундов выполняется раньше проверки relation_score.
     """
+
+    STRONG_ALIGNMENT_LABELS = {
+        "strongly_related",
+        "related",
+        "aligned",
+        "same_topic",
+        "highly_related",
+        "very_related",
+    }
 
     def __init__(
             self,
@@ -54,6 +73,9 @@ class ProjectCore:
     ) -> None:
         self.storage = storage
         self.llm_client = llm_client
+        self.relation_threshold = float(relation_threshold)
+        self.max_alignment_rounds = int(max_alignment_rounds)
+        self.max_defense_questions = int(max_defense_questions)
 
         self.ingest = IngestAgent(
             storage=self.storage,
@@ -63,8 +85,8 @@ class ProjectCore:
         self.topic_alignment = TopicAlignmentAgent(
             storage=self.storage,
             llm_client=self.llm_client,
-            relation_threshold=relation_threshold,
-            max_rounds=max_alignment_rounds,
+            relation_threshold=self.relation_threshold,
+            max_rounds=self.max_alignment_rounds,
         )
         self.methodics = MethodicsAgent(
             storage=self.storage,
@@ -73,7 +95,7 @@ class ProjectCore:
         self.defense = DefenseAgent(
             storage=self.storage,
             llm_client=self.llm_client,
-            max_questions=max_defense_questions,
+            max_questions=self.max_defense_questions,
         )
         self.feedback = FeedbackAgent(
             storage=self.storage,
@@ -280,9 +302,29 @@ class ProjectCore:
         - оценка связи
         - если надо, генерация уточняющих вопросов
         - если связь уже достаточна, формирование и фиксация спецификации
+
+        Исправление:
+        если в сессии уже есть уверенная оценка связи, тема фиксируется
+        до нового запуска агента. После запуска агента результат также
+        проверяется повторно, чтобы восстановиться из ошибочного rejected.
         """
         session = self._resolve_topic_session(lab_id=lab_id, topic_session_id=topic_session_id)
+
+        preflight = self._finalize_if_confident_alignment(session, source="preflight")
+        if preflight is not None:
+            return preflight
+
         result = self.topic_alignment.run_alignment_cycle(session["topic_session_id"])
+
+        fresh_session = self.storage.get_topic_session(session["topic_session_id"]) or session
+        postflight = self._finalize_if_confident_alignment(
+            fresh_session,
+            source="postflight",
+            previous_result=result,
+        )
+        if postflight is not None:
+            return postflight
+
         return {
             **result,
             "snapshot": self.get_alignment_snapshot(topic_session_id=session["topic_session_id"]),
@@ -347,6 +389,7 @@ class ProjectCore:
         Полезно, если LLM уже собрала контекст, но преподаватель хочет завершить этап вручную.
         """
         session = self._resolve_topic_session(lab_id=lab_id, topic_session_id=topic_session_id)
+        self._make_topic_session_finalizable(session["topic_session_id"])
         result = self.topic_alignment.finalize_alignment(session["topic_session_id"])
         return {
             **result,
@@ -696,6 +739,648 @@ class ProjectCore:
             "student_feedback": feedback_item,
         }
 
+    # Generation evaluation
+
+    def create_evaluation_case(
+            self,
+            *,
+            scenario_part: str,
+            method_name: str,
+            title: str = "",
+            description: str = "",
+            lab_id: Optional[str] = None,
+            input_json: Optional[dict[str, Any]] = None,
+            generated_output_json: Optional[dict[str, Any]] = None,
+            expected_notes: str = "",
+            tags: Optional[list[str]] = None,
+            is_active: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Создает сохраненный кейс оценки генерации.
+
+        Кейс хранит входной контекст, результат генерации и указание на часть
+        сценария. Это не unit-тест кода, а пример для проверки качества ответа
+        модели через LLM-оценщик и формальные эвристики.
+        """
+        if lab_id:
+            self.get_lab(lab_id)
+
+        return self.storage.create_evaluation_case(
+            scenario_part=scenario_part,
+            method_name=method_name,
+            title=title,
+            description=description,
+            lab_id=lab_id,
+            input_json=input_json or {},
+            generated_output_json=generated_output_json or {},
+            expected_notes=expected_notes,
+            tags=tags or [],
+            is_active=is_active,
+        )
+
+    def update_evaluation_case(
+            self,
+            case_id: str,
+            **fields: Any,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Обновляет сохраненный кейс оценки генерации.
+        """
+        return self.storage.update_evaluation_case(case_id, **fields)
+
+    def get_evaluation_case(self, case_id: str) -> dict[str, Any]:
+        """
+        Возвращает один кейс оценки генерации.
+        """
+        case = self.storage.get_evaluation_case(case_id)
+        if not case:
+            raise ValueError(f"Кейс оценки генерации не найден: {case_id}")
+        return case
+
+    def list_evaluation_cases(
+            self,
+            *,
+            lab_id: Optional[str] = None,
+            scenario_part: Optional[str] = None,
+            method_name: Optional[str] = None,
+            active_only: bool = False,
+            limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """
+        Возвращает сохраненные кейсы оценки генерации.
+        """
+        if lab_id:
+            self.get_lab(lab_id)
+        return self.storage.list_evaluation_cases(
+            lab_id=lab_id,
+            scenario_part=scenario_part,
+            method_name=method_name,
+            active_only=active_only,
+            limit=limit,
+        )
+
+    def delete_evaluation_case(self, case_id: str) -> None:
+        """
+        Удаляет кейс оценки генерации.
+        """
+        self.storage.delete_evaluation_case(case_id)
+
+    def create_topic_final_evaluation_case_from_lab(
+            self,
+            *,
+            lab_id: str,
+            title: str = "",
+            description: str = "",
+            tags: Optional[list[str]] = None,
+            is_active: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Создает кейс оценки итоговой согласованной темы по текущему состоянию задания.
+
+        Вход: тема студента, тема преподавателя, сессия согласования.
+        Выход: сохраненная согласованная спецификация задания.
+        """
+        snapshot = self.get_alignment_snapshot(lab_id=lab_id)
+        agreed_spec = snapshot.get("agreed_spec")
+        if not agreed_spec:
+            raise ValueError("Для кейса итоговой темы нужна уже зафиксированная согласованная спецификация.")
+
+        return self.create_evaluation_case(
+            lab_id=lab_id,
+            scenario_part="topic_final",
+            method_name="build_agreed_spec",
+            title=title or "Оценка итоговой согласованной темы",
+            description=description,
+            input_json={
+                "lab": snapshot.get("lab"),
+                "topic_session": snapshot.get("topic_session"),
+                "student_topic": snapshot.get("student_input"),
+                "teacher_topic": snapshot.get("teacher_input"),
+                "topic_turns": snapshot.get("topic_turns") or [],
+            },
+            generated_output_json={"generated_topic": agreed_spec},
+            tags=tags or ["topic", "final"],
+            is_active=is_active,
+        )
+
+    def create_clarification_questions_evaluation_case_from_session(
+            self,
+            *,
+            lab_id: Optional[str] = None,
+            topic_session_id: Optional[str] = None,
+            title: str = "",
+            description: str = "",
+            tags: Optional[list[str]] = None,
+            is_active: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Создает кейс оценки уточняющих вопросов по текущей сессии согласования.
+        """
+        snapshot = self.get_alignment_snapshot(lab_id=lab_id, topic_session_id=topic_session_id)
+        session = snapshot["topic_session"]
+        turns = snapshot.get("topic_turns") or []
+
+        student_questions = [
+            str(item.get("question_text") or "").strip()
+            for item in turns
+            if item.get("turn_kind") == "question" and item.get("side") == SIDE_STUDENT and str(
+                item.get("question_text") or "").strip()
+        ]
+        teacher_questions = [
+            str(item.get("question_text") or "").strip()
+            for item in turns
+            if item.get("turn_kind") == "question" and item.get("side") == SIDE_TEACHER and str(
+                item.get("question_text") or "").strip()
+        ]
+
+        if not student_questions and not teacher_questions:
+            raise ValueError("В сессии пока нет уточняющих вопросов для формирования кейса.")
+
+        return self.create_evaluation_case(
+            lab_id=session["lab_id"],
+            scenario_part="topic_clarification_questions",
+            method_name="generate_clarification_questions",
+            title=title or "Оценка уточняющих вопросов",
+            description=description,
+            input_json={
+                "lab": snapshot.get("lab"),
+                "topic_session": session,
+                "student_topic": snapshot.get("student_input"),
+                "teacher_topic": snapshot.get("teacher_input"),
+            },
+            generated_output_json={
+                "generated_questions": {
+                    "student_questions": student_questions,
+                    "teacher_questions": teacher_questions,
+                }
+            },
+            tags=tags or ["topic", "questions"],
+            is_active=is_active,
+        )
+
+    def create_topic_process_evaluation_case_from_session(
+            self,
+            *,
+            lab_id: Optional[str] = None,
+            topic_session_id: Optional[str] = None,
+            title: str = "",
+            description: str = "",
+            tags: Optional[list[str]] = None,
+            is_active: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Создает кейс оценки процесса согласования темы.
+
+        Процесс собирается из сохраненных вопросов по сессии. Если сессия уже
+        финализирована, finalized=True, а finalized_round берется из round_no.
+        """
+        snapshot = self.get_alignment_snapshot(lab_id=lab_id, topic_session_id=topic_session_id)
+        session = snapshot["topic_session"]
+        turns = snapshot.get("topic_turns") or []
+        agreed_spec = snapshot.get("agreed_spec")
+
+        questions = {
+            "student_questions": [
+                str(item.get("question_text") or "").strip()
+                for item in turns
+                if item.get("turn_kind") == "question" and item.get("side") == SIDE_STUDENT and str(
+                    item.get("question_text") or "").strip()
+            ],
+            "teacher_questions": [
+                str(item.get("question_text") or "").strip()
+                for item in turns
+                if item.get("turn_kind") == "question" and item.get("side") == SIDE_TEACHER and str(
+                    item.get("question_text") or "").strip()
+            ],
+        }
+
+        generated_topic = agreed_spec or {
+            "agreed_title": snapshot["lab"].get("title", ""),
+            "agreed_description": snapshot["lab"].get("description", ""),
+        }
+
+        rounds = [
+            {
+                "round_no": int(session.get("round_no") or 1),
+                "student_topic": snapshot.get("student_input"),
+                "teacher_topic": snapshot.get("teacher_input"),
+                "generated_topic": generated_topic,
+                "generated_questions": questions,
+            }
+        ]
+
+        finalized = bool(agreed_spec or session.get("status") == STATUS_FINALIZED)
+        finalized_round = int(session.get("round_no") or 1) if finalized else None
+
+        return self.create_evaluation_case(
+            lab_id=session["lab_id"],
+            scenario_part="topic_alignment_process",
+            method_name="run_alignment_process",
+            title=title or "Оценка процесса согласования темы",
+            description=description,
+            input_json={
+                "lab": snapshot.get("lab"),
+                "student_topic": snapshot.get("student_input"),
+                "teacher_topic": snapshot.get("teacher_input"),
+                "rounds": rounds,
+                "finalized": finalized,
+                "finalized_round": finalized_round,
+                "max_rounds": self.max_alignment_rounds,
+            },
+            generated_output_json={"rounds": rounds},
+            tags=tags or ["topic", "process"],
+            is_active=is_active,
+        )
+
+    def create_defense_questions_evaluation_case_from_session(
+            self,
+            *,
+            defense_session_id: str,
+            title: str = "",
+            description: str = "",
+            tags: Optional[list[str]] = None,
+            is_active: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Создает кейс оценки вопросов для защиты по существующей defense-сессии.
+        """
+        session = self.storage.get_defense_session(defense_session_id)
+        if not session:
+            raise ValueError(f"Сессия защиты не найдена: {defense_session_id}")
+
+        lab_id = session["lab_id"]
+        lab = self.get_lab(lab_id)
+        submission = self.storage.get_submission(session.get("submission_id")) if session.get(
+            "submission_id") else None
+        spec = self.storage.get_agreed_spec_by_lab(lab_id)
+        qa_turns = self.storage.list_qa_turns(defense_session_id)
+        plan = session.get("plan_json") or {}
+        question_pool = plan.get("question_pool") or [item.get("question_text") for item in qa_turns if
+                                                      item.get("question_text")]
+
+        if not question_pool:
+            raise ValueError("В сессии защиты пока нет сгенерированных вопросов.")
+
+        return self.create_evaluation_case(
+            lab_id=lab_id,
+            scenario_part="defense_questions",
+            method_name="build_question_pool",
+            title=title or "Оценка вопросов для защиты",
+            description=description,
+            input_json={
+                "lab": lab,
+                "agreed_spec": spec,
+                "submission": submission,
+                "submission_analysis": (submission or {}).get("analysis_json", {}),
+                "defense_session": session,
+                "qa_turns": qa_turns,
+            },
+            generated_output_json={"generated_questions": question_pool},
+            tags=tags or ["defense", "questions"],
+            is_active=is_active,
+        )
+
+    def run_evaluation_case(
+            self,
+            case_id: str,
+            *,
+            run_id: Optional[str] = None,
+            k: float = 0.7,
+            use_llm_judge: bool = True,
+            save_result: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Запускает оценку одного кейса.
+
+        Сначала при необходимости вызывается сторонняя модель-оценщик, затем
+        evaluation.py считает эвристики, нормализует LLM-оценку и объединяет
+        обе части по формуле final_score = k * llm_score + (1 - k) * heuristic_score.
+        """
+        case = self.get_evaluation_case(case_id)
+        own_run = False
+
+        if run_id is None:
+            run = self.storage.create_evaluation_run(
+                title=f"Оценка кейса: {case.get('title') or case_id}",
+                model_name=self._get_model_name(),
+                judge_model_name=self._get_model_name(),
+                k=k,
+                status="running",
+                meta={"mode": "single_case", "use_llm_judge": use_llm_judge},
+            )
+            run_id = run["run_id"]
+            own_run = True
+
+        result = self._evaluate_case_payload(case, k=k, use_llm_judge=use_llm_judge)
+
+        saved_result = None
+        if save_result:
+            saved_result = self.storage.save_evaluation_result_from_dict(
+                run_id=run_id,
+                case_id=case_id,
+                result=result,
+            )
+
+        if own_run:
+            self.storage.finish_evaluation_run(
+                run_id,
+                status="finished",
+                meta={"result_count": 1},
+            )
+
+        return {
+            "run_id": run_id,
+            "case": case,
+            "result": result,
+            "saved_result": saved_result,
+        }
+
+    def run_evaluation_suite(
+            self,
+            *,
+            lab_id: Optional[str] = None,
+            scenario_part: Optional[str] = None,
+            method_name: Optional[str] = None,
+            active_only: bool = True,
+            k: float = 0.7,
+            use_llm_judge: bool = True,
+            title: str = "",
+            limit: int = 200,
+    ) -> dict[str, Any]:
+        """
+        Прогоняет набор сохраненных кейсов и сохраняет итоговую таблицу результатов.
+
+        Возвращает запуск, список результатов и плоские строки отчета для Streamlit/CSV.
+        Ошибка в одном кейсе не останавливает весь прогон: по такому кейсу сохраняется
+        результат с final_score=0 и текстом ошибки.
+        """
+        if lab_id:
+            self.get_lab(lab_id)
+
+        cases = self.storage.list_evaluation_cases(
+            lab_id=lab_id,
+            scenario_part=scenario_part,
+            method_name=method_name,
+            active_only=active_only,
+            limit=limit,
+        )
+
+        run = self.storage.create_evaluation_run(
+            title=title or "Оценка генерации",
+            model_name=self._get_model_name(),
+            judge_model_name=self._get_model_name() if use_llm_judge else "",
+            k=k,
+            status="running",
+            meta={
+                "lab_id": lab_id,
+                "scenario_part": scenario_part,
+                "method_name": method_name,
+                "active_only": active_only,
+                "use_llm_judge": use_llm_judge,
+                "case_count": len(cases),
+            },
+        )
+
+        saved_results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        for case in cases:
+            case_id = case["case_id"]
+            try:
+                result = self._evaluate_case_payload(case, k=k, use_llm_judge=use_llm_judge)
+                saved = self.storage.save_evaluation_result_from_dict(
+                    run_id=run["run_id"],
+                    case_id=case_id,
+                    result=result,
+                )
+                saved_results.append(saved)
+            except Exception as exc:
+                error_result = self._build_failed_evaluation_result(case, exc, k=k)
+                saved = self.storage.save_evaluation_result_from_dict(
+                    run_id=run["run_id"],
+                    case_id=case_id,
+                    result=error_result,
+                )
+                saved_results.append(saved)
+                errors.append({"case_id": case_id, "error": str(exc)})
+
+        final_status = "failed" if errors else "finished"
+        finished_run = self.storage.finish_evaluation_run(
+            run["run_id"],
+            status=final_status,
+            meta={
+                "result_count": len(saved_results),
+                "error_count": len(errors),
+                "errors": errors[:20],
+            },
+        )
+
+        report_rows = self.storage.build_evaluation_report_rows(run_id=run["run_id"])
+
+        return {
+            "run": finished_run or run,
+            "cases": cases,
+            "results": saved_results,
+            "report_rows": report_rows,
+            "errors": errors,
+        }
+
+    def list_evaluation_runs(self, *, status: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
+        """
+        Возвращает историю запусков оценки генерации.
+        """
+        return self.storage.list_evaluation_runs(status=status, limit=limit)
+
+    def get_evaluation_run_report(self, run_id: str) -> dict[str, Any]:
+        """
+        Возвращает запуск, подробные результаты и плоскую таблицу отчета.
+        """
+        run = self.storage.get_evaluation_run(run_id)
+        if not run:
+            raise ValueError(f"Запуск оценки не найден: {run_id}")
+        return {
+            "run": run,
+            "results": self.storage.list_evaluation_results(run_id=run_id, limit=10000),
+            "report_rows": self.storage.build_evaluation_report_rows(run_id=run_id),
+        }
+
+    def _evaluate_case_payload(
+            self,
+            case: dict[str, Any],
+            *,
+            k: float,
+            use_llm_judge: bool,
+    ) -> dict[str, Any]:
+        prepared_case = self._prepare_case_for_evaluation(case, use_llm_judge=use_llm_judge)
+
+        from evaluation import evaluate_case
+
+        return evaluate_case(prepared_case, k=k)
+
+    def _prepare_case_for_evaluation(self, case: dict[str, Any], *, use_llm_judge: bool) -> dict[str, Any]:
+        """
+        При необходимости добавляет к кейсу LLM-оценку смыслового качества.
+        Эвристики при этом считаются отдельно в evaluation.py.
+        """
+        import copy
+
+        prepared = copy.deepcopy(case)
+        if not use_llm_judge:
+            return prepared
+
+        scenario_part = str(prepared.get("scenario_part") or "")
+        method_name = str(prepared.get("method_name") or "")
+        input_json = prepared.get("input_json") or {}
+        output_json = prepared.get("generated_output_json") or {}
+
+        if scenario_part == "topic_alignment_process":
+            prepared["input_json"] = self._attach_llm_scores_to_process_case(
+                input_json=input_json,
+                output_json=output_json,
+                method_name=method_name,
+            )
+            return prepared
+
+        prepared["llm_scores_json"] = self._judge_generation_with_llm(
+            scenario_part=scenario_part,
+            method_name=method_name,
+            input_context=input_json,
+            generated_output=output_json,
+        )
+        return prepared
+
+    def _attach_llm_scores_to_process_case(
+            self,
+            *,
+            input_json: dict[str, Any],
+            output_json: dict[str, Any],
+            method_name: str,
+    ) -> dict[str, Any]:
+        """
+        Для процесса согласования добавляет LLM-оценки к каждому раунду.
+        Формула процесса остается в evaluation.py: сначала round_score, затем scenario_score.
+        """
+        import copy
+
+        prepared_input = copy.deepcopy(input_json or {})
+        rounds = prepared_input.get("rounds") or (output_json or {}).get("rounds") or []
+        prepared_rounds: list[dict[str, Any]] = []
+
+        for index, round_item in enumerate(rounds, start=1):
+            item = copy.deepcopy(round_item or {})
+            base_context = {
+                "student_topic": item.get("student_topic") or prepared_input.get("student_topic"),
+                "teacher_topic": item.get("teacher_topic") or prepared_input.get("teacher_topic"),
+                "round_no": item.get("round_no", index),
+                "previous_rounds_count": index - 1,
+                "max_rounds": prepared_input.get("max_rounds", self.max_alignment_rounds),
+            }
+
+            generated_topic = item.get("generated_topic")
+            if generated_topic:
+                item["llm_scores_topic"] = self._judge_generation_with_llm(
+                    scenario_part="topic_final",
+                    method_name="build_agreed_spec",
+                    input_context=base_context,
+                    generated_output=generated_topic,
+                    extra_instruction="Оцени формулировку темы внутри одного раунда согласования.",
+                )
+
+            generated_questions = item.get("generated_questions") or item.get("questions")
+            if generated_questions:
+                item["llm_scores_questions"] = self._judge_generation_with_llm(
+                    scenario_part="topic_clarification_questions",
+                    method_name="generate_clarification_questions",
+                    input_context=base_context,
+                    generated_output=generated_questions,
+                    extra_instruction="Оцени уточняющие вопросы внутри одного раунда согласования.",
+                )
+
+            prepared_rounds.append(item)
+
+        prepared_input["rounds"] = prepared_rounds
+        return prepared_input
+
+    def _judge_generation_with_llm(
+            self,
+            *,
+            scenario_part: str,
+            method_name: str,
+            input_context: Any,
+            generated_output: Any,
+            extra_instruction: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Вызывает стороннюю модель-оценщик.
+
+        Если переданный llm_client уже умеет evaluate_generation, используется он.
+        Иначе используется функция evaluate_generation_with_llm из llm.py.
+        """
+        if self.llm_client is not None and hasattr(self.llm_client, "evaluate_generation"):
+            return self.llm_client.evaluate_generation(
+                scenario_part=scenario_part,
+                method_name=method_name,
+                input_context=input_context,
+                generated_output=generated_output,
+                extra_instruction=extra_instruction,
+            )
+
+        from llm import evaluate_generation_with_llm
+
+        return evaluate_generation_with_llm(
+            scenario_part=scenario_part,
+            method_name=method_name,
+            input_context=input_context,
+            generated_output=generated_output,
+            extra_instruction=extra_instruction,
+            client=self.llm_client,
+        )
+
+    def _build_failed_evaluation_result(
+            self,
+            case: dict[str, Any],
+            exc: Exception,
+            *,
+            k: float,
+    ) -> dict[str, Any]:
+        return {
+            "scenario_part": str(case.get("scenario_part") or ""),
+            "method_name": str(case.get("method_name") or ""),
+            "llm_score": None,
+            "heuristic_metrics": [
+                {
+                    "name": "evaluation_error",
+                    "value": type(exc).__name__,
+                    "score": 0.0,
+                    "weight": 1.0,
+                    "comment": str(exc),
+                }
+            ],
+            "heuristic_score": 0.0,
+            "final_score": 0.0,
+            "k": k,
+            "evaluation_mode": "failed",
+            "comment": f"Ошибка при оценке кейса: {exc}",
+            "extra": {"case_id": case.get("case_id"), "error_type": type(exc).__name__},
+        }
+
+    def _get_model_name(self) -> str:
+        """
+        Возвращает имя модели для метаданных evaluation_run.
+        """
+        if self.llm_client is not None:
+            config = getattr(self.llm_client, "config", None)
+            model = getattr(config, "model", None)
+            if model:
+                return str(model)
+            model = getattr(self.llm_client, "model", None)
+            if model:
+                return str(model)
+
+        import os
+
+        return os.getenv("MODEL_NAME", "")
+
     # Internal helpers
 
     def _resolve_topic_session(
@@ -715,6 +1400,159 @@ class ProjectCore:
         if not spec:
             raise ValueError("Сначала нужно согласовать и зафиксировать тему задания.")
         return spec
+
+    def _finalize_if_confident_alignment(
+            self,
+            session: dict[str, Any],
+            *,
+            source: str,
+            previous_result: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        topic_session_id = session["topic_session_id"]
+        lab_id = session["lab_id"]
+
+        if self.storage.get_agreed_spec_by_lab(lab_id):
+            return {
+                "status": STATUS_FINALIZED,
+                "reason": "already_finalized",
+                "snapshot": self.get_alignment_snapshot(topic_session_id=topic_session_id),
+            }
+
+        fresh_session = self.storage.get_topic_session(topic_session_id) or session
+        assessment = self._extract_alignment_assessment(fresh_session, previous_result)
+
+        if not self._is_confident_alignment(fresh_session, assessment):
+            return None
+
+        self._make_topic_session_finalizable(topic_session_id)
+        result = self.topic_alignment.finalize_alignment(topic_session_id)
+
+        return {
+            **result,
+            "status": result.get("status") or STATUS_FINALIZED,
+            "reason": result.get("reason") or f"confident_alignment_{source}",
+            "auto_fixed_rejected_round_limit": fresh_session.get("status") == STATUS_REJECTED,
+            "snapshot": self.get_alignment_snapshot(topic_session_id=topic_session_id),
+        }
+
+    def _extract_alignment_assessment(
+            self,
+            session: dict[str, Any],
+            previous_result: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        candidates: list[Any] = []
+
+        if previous_result:
+            candidates.extend(
+                [
+                    previous_result.get("assessment"),
+                    previous_result.get("llm_assessment_json"),
+                    previous_result.get("result"),
+                ]
+            )
+            snapshot = previous_result.get("snapshot")
+            if isinstance(snapshot, dict):
+                snapshot_session = snapshot.get("topic_session")
+                if isinstance(snapshot_session, dict):
+                    candidates.append(snapshot_session.get("llm_assessment_json"))
+
+        candidates.append(session.get("llm_assessment_json"))
+
+        merged: dict[str, Any] = {}
+        for item in candidates:
+            if isinstance(item, dict):
+                merged.update(item)
+
+        if "relation_score" not in merged:
+            merged["relation_score"] = session.get("relation_score")
+        if "relation_label" not in merged:
+            merged["relation_label"] = session.get("relation_label")
+        if "summary_text" not in merged:
+            merged["short_reason"] = session.get("summary_text")
+
+        return merged
+
+    def _is_confident_alignment(self, session: dict[str, Any], assessment: dict[str, Any]) -> bool:
+        score = self._safe_float(assessment.get("relation_score", session.get("relation_score")))
+        label = str(assessment.get("relation_label") or session.get("relation_label") or "").strip().lower()
+        needs_clarification = assessment.get("needs_clarification")
+        conflicts = assessment.get("conflicts") or []
+
+        if not isinstance(conflicts, list):
+            conflicts = [conflicts]
+
+        score_is_enough = score is not None and score >= self.relation_threshold
+        label_is_strong = label in self.STRONG_ALIGNMENT_LABELS
+        no_conflicts = len(conflicts) == 0
+        not_requesting_clarification = needs_clarification is False
+
+        return no_conflicts and (not_requesting_clarification or label_is_strong) and (
+                score_is_enough or label_is_strong)
+
+    def _make_topic_session_finalizable(self, topic_session_id: str) -> None:
+        """
+        Снимает ошибочный rejected перед фиксацией темы.
+        Метод написан осторожно: если в storage.py сигнатура update_topic_session
+        немного отличается, приложение не падает на этом вспомогательном шаге.
+        """
+        session = self.storage.get_topic_session(topic_session_id)
+        if not session:
+            return
+
+        if session.get("status") not in {STATUS_REJECTED, STATUS_NEEDS_CLARIFICATION, STATUS_DRAFT}:
+            return
+
+        assessment = self._extract_alignment_assessment(session)
+        summary = (
+                assessment.get("short_reason")
+                or assessment.get("summary_text")
+                or session.get("summary_text")
+                or "Темы уверенно связаны, сессия подготовлена к фиксации."
+        )
+
+        self._try_update_topic_session(
+            topic_session_id,
+            status=STATUS_ALIGNED,
+            summary_text=summary,
+            relation_score=assessment.get("relation_score", session.get("relation_score")),
+            relation_label=assessment.get("relation_label", session.get("relation_label")),
+            llm_assessment=assessment,
+        )
+
+    def _try_update_topic_session(self, topic_session_id: str, **fields: Any) -> Optional[dict[str, Any]]:
+        updater = getattr(self.storage, "update_topic_session", None)
+        if not callable(updater):
+            return None
+
+        attempts = (
+            lambda: updater(topic_session_id, **fields),
+            lambda: updater(topic_session_id=topic_session_id, **fields),
+            lambda: updater(topic_session_id, fields),
+            lambda: updater(topic_session_id=topic_session_id, updates=fields),
+        )
+
+        for attempt in attempts:
+            try:
+                updated = attempt()
+                if isinstance(updated, dict):
+                    return updated
+                if updated is not None:
+                    return self.storage.get_topic_session(topic_session_id)
+            except TypeError:
+                continue
+            except Exception:
+                return None
+
+        return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
 
 # Thin functional wrappers

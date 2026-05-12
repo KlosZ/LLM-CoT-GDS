@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import streamlit as st
-from dotenv import load_dotenv  # type: ignore
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    dotenv_override = (
+                              os.getenv("LLM_DOTENV_OVERRIDE")
+                              or os.getenv("DOTENV_OVERRIDE")
+                              or "1"
+                      ).strip().lower() not in {"0", "false", "no", "off"}
+    load_dotenv(override=dotenv_override)
+except Exception:
+    pass
 
 from core import ProjectCore, create_core
 from storage import (
@@ -41,11 +52,11 @@ WORK_TYPE_LABELS = {
 }
 
 
-def try_build_llm_client() -> Any:
+def try_build_llm_client() -> Tuple[Any, Optional[str]]:
     try:
         import llm  # type: ignore
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"Не удалось импортировать llm.py: {type(exc).__name__}: {exc}"
 
     factory_names = [
         "create_llm_client",
@@ -53,34 +64,44 @@ def try_build_llm_client() -> Any:
         "get_llm_client",
     ]
 
+    last_error: Optional[str] = None
+
     for name in factory_names:
         factory = getattr(llm, name, None)
         if callable(factory):
             try:
-                return factory()
+                client = factory()
+                return client, None
             except TypeError:
                 try:
-                    return factory(os.environ)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                    client = factory(os.environ)
+                    return client, None
+                except Exception as exc:
+                    last_error = f"{name}(os.environ): {type(exc).__name__}: {exc}"
+            except Exception as exc:
+                last_error = f"{name}(): {type(exc).__name__}: {exc}"
 
     client_cls = getattr(llm, "LLMClient", None)
     if client_cls:
         try:
-            return client_cls()
-        except Exception:
-            pass
+            client = client_cls()
+            return client, None
+        except Exception as exc:
+            last_error = f"LLMClient(): {type(exc).__name__}: {exc}"
 
-    return None
+    return None, last_error or "В llm.py не найден подходящий фабричный метод или класс LLMClient."
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_llm_client() -> Tuple[Any, Optional[str]]:
+    return try_build_llm_client()
 
 
 @st.cache_resource(show_spinner=False)
 def get_core() -> ProjectCore:
     db_path = os.getenv("APP_DB_PATH", "data/app.sqlite3")
     upload_dir = os.getenv("APP_UPLOAD_DIR", "uploads")
-    llm_client = try_build_llm_client()
+    llm_client, _llm_error = get_cached_llm_client()
 
     return create_core(
         db_path=db_path,
@@ -98,6 +119,62 @@ def rerun() -> None:
 
 def json_pretty(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def parse_json_text(value: str, *, default: Optional[Any] = None) -> Any:
+    """
+    Аккуратно разбирает JSON из текстового поля Streamlit.
+    Пустая строка возвращает default.
+    """
+    text = (value or "").strip()
+    if not text:
+        return default
+    return json.loads(text)
+
+
+def report_rows_to_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    """
+    Формирует CSV для скачивания итоговой таблицы оценки генерации.
+    """
+    if not rows:
+        return b""
+
+    preferred = [
+        "run_id",
+        "case_id",
+        "case_title",
+        "scenario_part",
+        "method_name",
+        "llm_relevance",
+        "llm_completeness",
+        "llm_clarity",
+        "llm_usefulness",
+        "llm_correctness",
+        "llm_score",
+        "heuristic_score",
+        "final_score",
+        "comment",
+    ]
+    extra = sorted({key for row in rows for key in row.keys()} - set(preferred))
+    fieldnames = [key for key in preferred if any(key in row for row in rows)] + extra
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def scenario_label(value: str) -> str:
+    mapping = {
+        "topic_final": "Итоговая тема",
+        "topic_clarification_questions": "Уточняющие вопросы",
+        "topic_alignment_process": "Процесс согласования темы",
+        "topic_alignment_round": "Раунд согласования темы",
+        "defense_questions": "Вопросы для защиты",
+    }
+    return mapping.get(value, value or "—")
 
 
 def work_type_label(value: str) -> str:
@@ -123,6 +200,7 @@ def ensure_state_defaults() -> None:
         "selected_lab_id": None,
         "selected_submission_id": None,
         "selected_defense_session_id": None,
+        "selected_evaluation_run_id": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -232,6 +310,48 @@ def render_qa_turns(turns: list[dict[str, Any]]) -> None:
                 st.code(json_pretty(evaluation), language="json")
 
 
+def render_llm_status() -> None:
+    llm_client, llm_error = get_cached_llm_client()
+
+    st.sidebar.divider()
+    st.sidebar.subheader("LLM")
+
+    if st.sidebar.button("Сбросить кэш ядра / LLM"):
+        st.cache_resource.clear()
+        rerun()
+
+    if llm_client is not None:
+        st.sidebar.success("LLM-клиент инициализирован.")
+    else:
+        st.sidebar.error("LLM-клиент не инициализирован.")
+        if llm_error:
+            with st.sidebar.expander("Причина"):
+                st.code(llm_error)
+
+    try:
+        import llm  # type: ignore
+
+        summary = llm.get_safe_config_summary() if hasattr(llm, "get_safe_config_summary") else {}
+        if summary:
+            with st.sidebar.expander("Диагностика .env"):
+                st.code(json_pretty(summary), language="json")
+    except Exception:
+        pass
+
+    if st.sidebar.button("Проверить LLM запросом"):
+        if llm_client is None:
+            st.sidebar.error("Сначала нужно исправить инициализацию LLM.")
+            return
+        try:
+            answer = llm_client.generate_text(
+                system_prompt="Ты тестовый помощник. Ответь ровно одним словом.",
+                user_prompt="Ответь: OK",
+            )
+            st.sidebar.success(f"Ответ LLM: {answer}")
+        except Exception as exc:
+            st.sidebar.error(f"{type(exc).__name__}: {exc}")
+
+
 def render_sidebar(core: ProjectCore) -> Optional[dict[str, Any]]:
     st.sidebar.title("Навигация")
     labs = core.storage.list_labs()
@@ -257,6 +377,8 @@ def render_sidebar(core: ProjectCore) -> Optional[dict[str, Any]]:
     else:
         selected_lab = None
         st.sidebar.info("Заданий пока нет.")
+
+    render_llm_status()
 
     st.sidebar.divider()
     st.sidebar.subheader("Создать новое задание")
@@ -353,7 +475,8 @@ def render_alignment_tab(core: ProjectCore, dashboard: dict[str, Any]) -> None:
         current_student = core.storage.get_topic_input(topic_session["topic_session_id"], SIDE_STUDENT) or {}
         with st.form("student_topic_form"):
             student_title = st.text_input("Тема студента", value=current_student.get("title", ""))
-            student_description = st.text_area("Описание темы студента", value=current_student.get("description", ""),
+            student_description = st.text_area("Описание темы студента",
+                                               value=current_student.get("description", ""),
                                                height=160)
             student_notes = st.text_area(
                 "Контекст студента",
@@ -395,7 +518,8 @@ def render_alignment_tab(core: ProjectCore, dashboard: dict[str, Any]) -> None:
         with st.form("teacher_topic_form"):
             teacher_title = st.text_input("Тема преподавателя", value=current_teacher.get("title", ""))
             teacher_description = st.text_area("Описание темы преподавателя",
-                                               value=current_teacher.get("description", ""), height=160)
+                                               value=current_teacher.get("description", ""),
+                                               height=160)
             teacher_notes = st.text_area(
                 "Контекст преподавателя",
                 value=(current_teacher.get("context_json") or {}).get("notes", ""),
@@ -899,6 +1023,379 @@ def render_review_tab(core: ProjectCore, dashboard: dict[str, Any]) -> None:
     render_policy_items(dashboard["policy_items"])
 
 
+def render_evaluation_tab(core: ProjectCore, dashboard: dict[str, Any]) -> None:
+    """
+    Служебная страница оценки качества генерации.
+
+    Страница не является частью пользовательского сценария защиты. Она нужна для
+    разработчика/проверяющего: создать сохраненные кейсы, прогнать их через
+    LLM-оценщик и формальные эвристики, а затем получить итоговую таблицу.
+    """
+    lab = dashboard["lab"]
+    lab_id = lab["lab_id"]
+
+    st.subheader("Оценка генерации")
+    st.info(
+        "Здесь проверяется качество генерации выбранной модели. Итоговая оценка считается "
+        "по формуле final_score = k * llm_score + (1 - k) * heuristic_score. "
+        "По умолчанию k = 0.7. Оценки LLM 1–5 нормализуются в диапазон 0.0–1.0, "
+        "а формальная оценка собирается из отдельных эвристик."
+    )
+
+    llm_client, llm_error = get_cached_llm_client()
+
+    st.markdown("### 1. Создание кейсов из текущего состояния задания")
+    st.caption(
+        "Кейс сохраняет входной контекст и уже полученный результат генерации. "
+        "После этого кейс можно многократно прогонять через оценку."
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        if st.button("Кейс итоговой темы"):
+            try:
+                case = core.create_topic_final_evaluation_case_from_lab(lab_id=lab_id)
+                st.success(f"Кейс создан: {case['case_id']}")
+                rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    with col2:
+        if st.button("Кейс уточняющих вопросов"):
+            try:
+                case = core.create_clarification_questions_evaluation_case_from_session(lab_id=lab_id)
+                st.success(f"Кейс создан: {case['case_id']}")
+                rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    with col3:
+        if st.button("Кейс процесса согласования"):
+            try:
+                case = core.create_topic_process_evaluation_case_from_session(lab_id=lab_id)
+                st.success(f"Кейс создан: {case['case_id']}")
+                rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    with col4:
+        defense_sessions = dashboard.get("defense_sessions") or []
+        if defense_sessions:
+            defense_options = {
+                f"{item.get('created_at', '')} · {item.get('status', '')} · {item.get('defense_session_id')}": item[
+                    "defense_session_id"]
+                for item in defense_sessions
+            }
+            selected_defense_label = st.selectbox(
+                "Сессия защиты",
+                options=list(defense_options.keys()),
+                key=f"evaluation_defense_session_{lab_id}",
+            )
+            selected_defense_id = defense_options[selected_defense_label]
+            if st.button("Кейс вопросов защиты"):
+                try:
+                    case = core.create_defense_questions_evaluation_case_from_session(
+                        defense_session_id=selected_defense_id,
+                    )
+                    st.success(f"Кейс создан: {case['case_id']}")
+                    rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            st.caption("Нет сессий защиты для формирования кейса.")
+
+    with st.expander("Создать кейс вручную"):
+        st.caption(
+            "Ручной кейс удобен, если заказчик передал отдельные примеры: входные данные, "
+            "результат генерации и пометки к ожидаемому поведению."
+        )
+        with st.form("manual_evaluation_case_form"):
+            manual_title = st.text_input("Название кейса")
+            manual_description = st.text_area("Описание / назначение", height=90)
+            manual_scenario = st.selectbox(
+                "Часть сценария",
+                options=[
+                    "topic_final",
+                    "topic_clarification_questions",
+                    "topic_alignment_process",
+                    "defense_questions",
+                ],
+                format_func=scenario_label,
+            )
+            manual_method = st.text_input("Метод / этап", value="build_agreed_spec")
+            manual_input = st.text_area(
+                "input_json",
+                value=json_pretty({
+                    "student_topic": "",
+                    "teacher_topic": "",
+                }),
+                height=180,
+            )
+            manual_output = st.text_area(
+                "generated_output_json",
+                value=json_pretty({"generated_topic": ""}),
+                height=160,
+            )
+            manual_notes = st.text_area("expected_notes", height=80)
+            manual_tags = st.text_input("Теги через запятую", value="manual")
+            manual_active = st.checkbox("Активный кейс", value=True)
+            manual_create = st.form_submit_button("Сохранить ручной кейс")
+
+        if manual_create:
+            try:
+                input_json = parse_json_text(manual_input, default={})
+                output_json = parse_json_text(manual_output, default={})
+                tags = [item.strip() for item in manual_tags.split(",") if item.strip()]
+                case = core.create_evaluation_case(
+                    lab_id=lab_id,
+                    scenario_part=manual_scenario,
+                    method_name=manual_method.strip() or manual_scenario,
+                    title=manual_title.strip() or "Ручной кейс оценки генерации",
+                    description=manual_description.strip(),
+                    input_json=input_json,
+                    generated_output_json=output_json,
+                    expected_notes=manual_notes.strip(),
+                    tags=tags,
+                    is_active=manual_active,
+                )
+                st.success(f"Кейс создан: {case['case_id']}")
+                rerun()
+            except Exception as exc:
+                st.error(f"Не удалось создать кейс: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    st.markdown("### 2. Сохраненные кейсы")
+
+    scope = st.radio(
+        "Область проверки",
+        options=["Текущее задание", "Все задания"],
+        horizontal=True,
+        key="evaluation_scope",
+    )
+    lab_filter = lab_id if scope == "Текущее задание" else None
+
+    scenario_options = {
+        "Все": None,
+        "Итоговая тема": "topic_final",
+        "Уточняющие вопросы": "topic_clarification_questions",
+        "Процесс согласования темы": "topic_alignment_process",
+        "Вопросы для защиты": "defense_questions",
+    }
+    scenario_selected = st.selectbox("Фильтр по части сценария", options=list(scenario_options.keys()))
+    scenario_filter = scenario_options[scenario_selected]
+    active_only = st.checkbox("Только активные кейсы", value=True)
+
+    cases = core.list_evaluation_cases(
+        lab_id=lab_filter,
+        scenario_part=scenario_filter,
+        active_only=active_only,
+        limit=500,
+    )
+
+    case_rows = [
+        {
+            "case_id": item.get("case_id"),
+            "title": item.get("title"),
+            "scenario_part": scenario_label(item.get("scenario_part", "")),
+            "method_name": item.get("method_name"),
+            "active": item.get("is_active"),
+            "updated_at": item.get("updated_at"),
+        }
+        for item in cases
+    ]
+
+    if case_rows:
+        st.dataframe(case_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("По выбранным фильтрам кейсов пока нет.")
+
+    if cases:
+        with st.expander("Просмотр / управление одним кейсом"):
+            case_options = {
+                f"{item.get('title') or 'Без названия'} · {item.get('case_id')}": item["case_id"]
+                for item in cases
+            }
+            selected_case_label = st.selectbox("Кейс", options=list(case_options.keys()))
+            selected_case_id = case_options[selected_case_label]
+            selected_case = next(item for item in cases if item["case_id"] == selected_case_id)
+
+            col_case_1, col_case_2, col_case_3 = st.columns(3)
+            with col_case_1:
+                if st.button("Включить / выключить кейс"):
+                    try:
+                        core.update_evaluation_case(
+                            selected_case_id,
+                            is_active=not bool(selected_case.get("is_active")),
+                        )
+                        st.success("Статус кейса обновлен.")
+                        rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            with col_case_2:
+                if st.button("Прогнать только этот кейс"):
+                    try:
+                        use_judge = bool(st.session_state.get("evaluation_use_llm_judge", llm_client is not None))
+                        k_value = float(st.session_state.get("evaluation_k", 0.7))
+                        result = core.run_evaluation_case(
+                            selected_case_id,
+                            k=k_value,
+                            use_llm_judge=use_judge,
+                            save_result=True,
+                        )
+                        st.session_state["selected_evaluation_run_id"] = result["run_id"]
+                        st.success("Кейс оценен.")
+                        rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            with col_case_3:
+                if st.button("Удалить кейс", type="secondary"):
+                    try:
+                        core.delete_evaluation_case(selected_case_id)
+                        st.success("Кейс удален.")
+                        rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+            st.markdown("**input_json**")
+            st.code(json_pretty(selected_case.get("input_json") or {}), language="json")
+            st.markdown("**generated_output_json**")
+            st.code(json_pretty(selected_case.get("generated_output_json") or {}), language="json")
+            if selected_case.get("expected_notes"):
+                st.markdown("**expected_notes**")
+                st.write(selected_case.get("expected_notes"))
+
+    st.divider()
+    st.markdown("### 3. Запуск оценки")
+
+    col_run_1, col_run_2, col_run_3 = st.columns([1, 1, 2])
+    with col_run_1:
+        k = st.slider(
+            "k — доверие к LLM-оценке",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.7,
+            step=0.05,
+            key="evaluation_k",
+            help="final_score = k * llm_score + (1 - k) * heuristic_score",
+        )
+    with col_run_2:
+        use_llm_judge = st.checkbox(
+            "Использовать LLM-оценщик",
+            value=llm_client is not None,
+            key="evaluation_use_llm_judge",
+        )
+        if use_llm_judge and llm_client is None:
+            st.warning("LLM-клиент не инициализирован. Оценщик не сможет выполниться.")
+            if llm_error:
+                with st.expander("Причина ошибки LLM"):
+                    st.code(llm_error)
+    with col_run_3:
+        run_title = st.text_input("Название запуска", value="Оценка генерации")
+
+    if st.button("Запустить оценку по выбранным кейсам", type="primary"):
+        try:
+            if not cases:
+                st.warning("Сначала создайте хотя бы один кейс или измените фильтры.")
+            else:
+                result = core.run_evaluation_suite(
+                    lab_id=lab_filter,
+                    scenario_part=scenario_filter,
+                    active_only=active_only,
+                    k=k,
+                    use_llm_judge=use_llm_judge,
+                    title=run_title.strip() or "Оценка генерации",
+                    limit=500,
+                )
+                st.session_state["selected_evaluation_run_id"] = result["run"]["run_id"]
+                if result.get("errors"):
+                    st.warning(f"Оценка завершена с ошибками: {len(result['errors'])}")
+                else:
+                    st.success("Оценка завершена.")
+                rerun()
+        except Exception as exc:
+            st.error(f"Не удалось запустить оценку: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    st.markdown("### 4. Итоговая таблица")
+
+    runs = core.list_evaluation_runs(limit=50)
+    if not runs:
+        st.info("Запусков оценки пока нет.")
+        return
+
+    run_options = {
+        f"{item.get('created_at', '')} · {item.get('title') or 'Оценка'} · {item.get('status', '')} · {item.get('run_id')}":
+            item["run_id"]
+        for item in runs
+    }
+
+    current_run_id = st.session_state.get("selected_evaluation_run_id")
+    if not current_run_id or current_run_id not in run_options.values():
+        current_run_id = runs[0]["run_id"]
+        st.session_state["selected_evaluation_run_id"] = current_run_id
+
+    current_run_label = next(
+        label for label, run_id in run_options.items() if run_id == st.session_state["selected_evaluation_run_id"]
+    )
+    selected_run_label = st.selectbox(
+        "Запуск оценки",
+        options=list(run_options.keys()),
+        index=list(run_options.keys()).index(current_run_label),
+    )
+    st.session_state["selected_evaluation_run_id"] = run_options[selected_run_label]
+
+    try:
+        report = core.get_evaluation_run_report(st.session_state["selected_evaluation_run_id"])
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    run = report["run"]
+    report_rows = report.get("report_rows") or []
+    results = report.get("results") or []
+
+    col_metric_1, col_metric_2, col_metric_3, col_metric_4 = st.columns(4)
+    col_metric_1.metric("Статус", run.get("status", ""))
+    col_metric_2.metric("k", run.get("k", 0.7))
+    col_metric_3.metric("Кейсов", len(report_rows))
+    final_scores = [row.get("final_score") for row in report_rows if row.get("final_score") is not None]
+    avg_score = sum(float(x) for x in final_scores) / len(final_scores) if final_scores else 0.0
+    col_metric_4.metric("Средний final_score", round(avg_score, 4))
+
+    if report_rows:
+        st.dataframe(report_rows, use_container_width=True, hide_index=True)
+
+        col_download_1, col_download_2 = st.columns(2)
+        with col_download_1:
+            st.download_button(
+                "Скачать таблицу CSV",
+                data=report_rows_to_csv_bytes(report_rows),
+                file_name=f"evaluation_report_{run['run_id']}.csv",
+                mime="text/csv",
+            )
+        with col_download_2:
+            st.download_button(
+                "Скачать подробности JSON",
+                data=json_pretty(report).encode("utf-8"),
+                file_name=f"evaluation_report_{run['run_id']}.json",
+                mime="application/json",
+            )
+
+        with st.expander("Подробные результаты и эвристики"):
+            for idx, item in enumerate(results, start=1):
+                st.markdown(f"**Результат {idx}: {item.get('case_id') or 'без case_id'}**")
+                st.caption(
+                    f"Сценарий: {scenario_label(item.get('scenario_part', ''))} · "
+                    f"Метод: {item.get('method_name', '')} · "
+                    f"final_score: {item.get('final_score')}"
+                )
+                result_json = item.get("result_json") or {}
+                st.code(json_pretty(result_json), language="json")
+    else:
+        st.info("В выбранном запуске нет результатов.")
+
+
 def main() -> None:
     st.set_page_config(
         page_title=APP_TITLE,
@@ -912,11 +1409,17 @@ def main() -> None:
     st.title(APP_TITLE)
     st.caption(APP_CAPTION)
 
-    if core.llm_client is None:
+    llm_client, llm_error = get_cached_llm_client()
+    if llm_client is None:
         st.warning(
             "LLM-клиент не инициализирован. Система работает в эвристическом режиме. "
-            "Это допустимо для теста, но логика согласования будет проще."
+            "Проверьте .env, ключ ProxyAPI и нажмите «Сбросить кэш ядра / LLM» в боковой панели."
         )
+        if llm_error:
+            with st.expander("Ошибка инициализации LLM"):
+                st.code(llm_error)
+    else:
+        st.success("LLM-клиент инициализирован. Эвристический режим будет использоваться только как fallback.")
 
     selected_lab = render_sidebar(core)
 
@@ -930,7 +1433,7 @@ def main() -> None:
 
     dashboard = core.get_lab_dashboard(selected_lab["lab_id"])
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         [
             "Обзор",
             "Согласование темы",
@@ -938,6 +1441,7 @@ def main() -> None:
             "Работа студента",
             "Защита",
             "Ревью и policy",
+            "Оценка генерации",
         ]
     )
 
@@ -958,6 +1462,9 @@ def main() -> None:
 
     with tab6:
         render_review_tab(core, dashboard)
+
+    with tab7:
+        render_evaluation_tab(core, dashboard)
 
 
 if __name__ == "__main__":

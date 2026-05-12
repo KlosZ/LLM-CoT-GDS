@@ -23,9 +23,20 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv  # type: ignore
+try:
+    from dotenv import load_dotenv  # type: ignore
 
-load_dotenv()
+    # Важно: load_dotenv() без override=True не перезаписывает уже существующие
+    # переменные окружения Windows. Из-за этого приложение может брать старый
+    # OPENAI_API_KEY и получать 401 Invalid API Key.
+    dotenv_override = (
+                              os.getenv("LLM_DOTENV_OVERRIDE")
+                              or os.getenv("DOTENV_OVERRIDE")
+                              or "1"
+                      ).strip().lower() not in {"0", "false", "no", "off"}
+    load_dotenv(override=dotenv_override)
+except Exception:
+    pass
 
 JsonDict = Dict[str, Any]
 
@@ -56,6 +67,73 @@ class LLMOutputParseError(LLMError):
     pass
 
 
+# Env helpers
+
+
+def _clean_env_value(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    value = _clean_env_value(os.getenv(name))
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = _clean_env_value(os.getenv(name))
+    if not value:
+        return default
+    try:
+        return float(value.replace(",", "."))
+    except ValueError:
+        return default
+
+
+def _mask_secret(value: str) -> str:
+    value = _clean_env_value(value)
+    if not value:
+        return ""
+    if len(value) <= 10:
+        return value[:2] + "***"
+    return value[:6] + "***" + value[-4:]
+
+
+def _sanitize_schema_name(name: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(name or "output")).strip("_")
+    return name[:64] or "output"
+
+
+def get_safe_config_summary() -> JsonDict:
+    """
+    Безопасная диагностика для UI/консоли. Ключ маскируется.
+    """
+    openai_key = _clean_env_value(os.getenv("OPENAI_API_KEY"))
+    proxy_key = _clean_env_value(os.getenv("PROXYAPI_API_KEY"))
+    selected_key = openai_key or proxy_key
+
+    return {
+        "OPENAI_API_KEY_present": bool(openai_key),
+        "PROXYAPI_API_KEY_present": bool(proxy_key),
+        "selected_key_masked": _mask_secret(selected_key),
+        "OPENAI_BASE_URL": _clean_env_value(os.getenv("OPENAI_BASE_URL")),
+        "PROXYAPI_BASE_URL": _clean_env_value(os.getenv("PROXYAPI_BASE_URL")),
+        "MODEL_NAME": _clean_env_value(os.getenv("MODEL_NAME")),
+        "LLM_TEMPERATURE": _clean_env_value(os.getenv("LLM_TEMPERATURE")),
+        "LLM_MAX_TOKENS": _clean_env_value(os.getenv("LLM_MAX_TOKENS")),
+        "LLM_TIMEOUT_SECONDS": _clean_env_value(os.getenv("LLM_TIMEOUT_SECONDS")),
+    }
+
+
 # Data classes
 
 
@@ -70,16 +148,27 @@ class LLMConfig:
 
     @staticmethod
     def from_env() -> "LLMConfig":
-        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        openai_key = _clean_env_value(os.getenv("OPENAI_API_KEY"))
+        proxy_key = _clean_env_value(os.getenv("PROXYAPI_API_KEY"))
+        api_key = openai_key or proxy_key
+
         if not api_key:
             raise LLMAuthError(
-                "OPENAI_API_KEY is missing. Put it in your .env and load it, "
-                "or set it as an environment variable."
+                "LLM API key is missing. Set OPENAI_API_KEY in .env. "
+                "For ProxyAPI you may also use PROXYAPI_API_KEY."
             )
 
-        base_url = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
-        model = (os.getenv("MODEL_NAME") or "gpt-4o-mini").strip()
+        base_url = (
+                _clean_env_value(os.getenv("OPENAI_BASE_URL"))
+                or _clean_env_value(os.getenv("PROXYAPI_BASE_URL"))
+                or (
+                    "https://api.proxyapi.ru/openai/v1"
+                    if proxy_key and not openai_key
+                    else "https://api.openai.com/v1"
+                )
+        ).rstrip("/")
 
+        model = _clean_env_value(os.getenv("MODEL_NAME")) or "gpt-4o-mini"
         temperature = _env_float("LLM_TEMPERATURE", 0.2)
         max_tokens = _env_int("LLM_MAX_TOKENS", 1200)
         timeout = _env_int("LLM_TIMEOUT_SECONDS", 60)
@@ -202,6 +291,16 @@ SCHEMA_REGISTRY: Dict[str, JsonDict] = {
             "highlights": _schema_array(_schema_str()),
         }
     ),
+    "generation_evaluation": _schema_obj(
+        {
+            "relevance": _schema_num(),
+            "completeness": _schema_num(),
+            "clarity": _schema_num(),
+            "usefulness": _schema_num(),
+            "correctness": _schema_num(),
+            "comment": _schema_str(),
+        }
+    ),
     "policy_update": _schema_obj(
         {
             "items": {
@@ -293,6 +392,24 @@ class LLMClient:
                 return parsed
             raise LLMOutputParseError("Structured JSON response was expected but not parsed.")
         return response.json
+
+    def evaluate_generation(
+            self,
+            *,
+            scenario_part: str,
+            input_context: Any,
+            generated_output: Any,
+            method_name: Optional[str] = None,
+            extra_instruction: Optional[str] = None,
+    ) -> JsonDict:
+        return evaluate_generation_with_llm(
+            scenario_part=scenario_part,
+            input_context=input_context,
+            generated_output=generated_output,
+            method_name=method_name,
+            extra_instruction=extra_instruction,
+            client=self,
+        )
 
     def complete_json(self, **kwargs: Any) -> JsonDict:
         return self.generate_json(**kwargs)
@@ -449,7 +566,7 @@ def _inject_json_instructions(messages: List[JsonDict], *, json_schema: JsonDict
     # Добавим инструкцию в начало system, либо создадим system
     msgs = [dict(m) for m in messages]
     if msgs and msgs[0].get("role") == "system":
-        msgs[0]["content"] = (msgs[0].get("content", "").rstrip() + "\n\n" + instr).strip()
+        msgs[0]["content"] = (str(msgs[0].get("content", "")).rstrip() + "\n\n" + instr).strip()
     else:
         msgs.insert(0, {"role": "system", "content": instr})
     return msgs
@@ -491,7 +608,7 @@ def _call_with_openai_lib(
         kwargs["response_format"] = {
             "type": "json_schema",
             "json_schema": {
-                "name": schema_name,
+                "name": _sanitize_schema_name(schema_name),
                 "schema": json_schema,
                 "strict": bool(strict_json),
             },
@@ -501,7 +618,9 @@ def _call_with_openai_lib(
         resp = client.chat.completions.create(**kwargs)
         raw = resp.model_dump() if hasattr(resp, "model_dump") else json.loads(resp.json())
         return raw
-    except Exception as e:
+    except Exception as first_exc:
+        _raise_mapped_openai_error(first_exc)
+
         # Пробуем более менее строгий JSON, если формат схемы не поддерживается
         if json_schema is not None:
             try:
@@ -510,17 +629,21 @@ def _call_with_openai_lib(
                 resp2 = client.chat.completions.create(**kwargs2)
                 raw2 = resp2.model_dump() if hasattr(resp2, "model_dump") else json.loads(resp2.json())
                 return raw2
-            except Exception:
-                pass
-        _raise_mapped_openai_error(e)
-        raise
+            except Exception as second_exc:
+                _raise_mapped_openai_error(second_exc)
+
+                raise second_exc
+
+        raise first_exc
 
 
 def _raise_mapped_openai_error(e: Exception) -> None:
     msg = str(e).lower()
-    if "api key" in msg or "authentication" in msg or "401" in msg:
+    status_code = getattr(e, "status_code", None)
+
+    if status_code == 401 or "api key" in msg or "authentication" in msg or "401" in msg:
         raise LLMAuthError(str(e))
-    if "rate limit" in msg or "429" in msg:
+    if status_code == 429 or "rate limit" in msg or "429" in msg:
         raise LLMRateLimitError(str(e))
 
 
@@ -552,57 +675,92 @@ def _call_with_http(
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {
-                "name": schema_name,
+                "name": _sanitize_schema_name(schema_name),
                 "schema": json_schema,
                 "strict": bool(strict_json),
             },
         }
 
+    return _post_json_with_fallback(
+        url=url,
+        api_key=cfg.api_key,
+        payload=payload,
+        timeout_seconds=cfg.timeout_seconds,
+        allow_json_object_fallback=json_schema is not None,
+    )
+
+
+def _post_json_with_fallback(
+        *,
+        url: str,
+        api_key: str,
+        payload: JsonDict,
+        timeout_seconds: int,
+        allow_json_object_fallback: bool,
+) -> JsonDict:
+    try:
+        return _post_json(url=url, api_key=api_key, payload=payload, timeout_seconds=timeout_seconds)
+    except urllib.error.HTTPError as http_error:
+        response_body = http_error.read().decode("utf-8", errors="replace") if hasattr(http_error, "read") else ""
+
+        if allow_json_object_fallback and http_error.code in (400, 404, 422):
+            try:
+                payload2 = dict(payload)
+                payload2["response_format"] = {"type": "json_object"}
+                return _post_json(
+                    url=url,
+                    api_key=api_key,
+                    payload=payload2,
+                    timeout_seconds=timeout_seconds,
+                )
+            except urllib.error.HTTPError as http_error2:
+                response_body2 = (
+                    http_error2.read().decode("utf-8", errors="replace")
+                    if hasattr(http_error2, "read")
+                    else ""
+                )
+                _raise_mapped_http_error(http_error2.code, response_body2 or str(http_error2))
+            except urllib.error.URLError as url_error2:
+                raise LLMError(f"LLM URL error: {url_error2}") from url_error2
+
+        _raise_mapped_http_error(http_error.code, response_body or str(http_error))
+        raise
+    except urllib.error.URLError as url_error:
+        raise LLMError(f"LLM URL error: {url_error}") from url_error
+
+
+def _post_json(
+        *,
+        url: str,
+        api_key: str,
+        payload: JsonDict,
+        timeout_seconds: int,
+) -> JsonDict:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url=url,
         data=body,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg.api_key}",
+            "Authorization": f"Bearer {api_key}",
         },
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=cfg.timeout_seconds) as resp:
-            resp_body = resp.read().decode("utf-8", errors="replace")
-            return json.loads(resp_body)
-    except urllib.error.HTTPError as he:
-        resp_body = he.read().decode("utf-8", errors="replace") if hasattr(he, "read") else ""
-        # json_schema не поддерживается -> пробуем через json_object
-        if json_schema is not None and he.code in (400, 422):
-            try:
-                payload2 = dict(payload)
-                payload2["response_format"] = {"type": "json_object"}
-                body2 = json.dumps(payload2, ensure_ascii=False).encode("utf-8")
-                req2 = urllib.request.Request(
-                    url=url,
-                    data=body2,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {cfg.api_key}",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req2, timeout=cfg.timeout_seconds) as resp2:
-                    resp_body2 = resp2.read().decode("utf-8", errors="replace")
-                    return json.loads(resp_body2)
-            except Exception:
-                pass
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        resp_body = resp.read().decode("utf-8", errors="replace")
+        return json.loads(resp_body)
 
-        if he.code == 401:
-            raise LLMAuthError(resp_body or str(he))
-        if he.code == 429:
-            raise LLMRateLimitError(resp_body or str(he))
-        raise LLMHTTPError(he.code, resp_body or str(he))
-    except urllib.error.URLError as ue:
-        raise LLMError(f"LLM URL error: {ue}") from ue
+
+def _raise_mapped_http_error(status_code: int, body: str) -> None:
+    body_l = str(body or "").lower()
+    if status_code == 401:
+        raise LLMAuthError(body or "LLM authentication error")
+    if status_code == 429:
+        raise LLMRateLimitError(body or "LLM rate limit error")
+    if "api key" in body_l or "authentication" in body_l:
+        raise LLMAuthError(body)
+    raise LLMHTTPError(status_code, body)
 
 
 # Response normalization + JSON parsing
@@ -683,19 +841,18 @@ def _parse_json_from_raw(raw: JsonDict) -> Optional[JsonDict]:
     # 2) message.tool_calls[].function.arguments (стиль вызова функций OpenAI)
     try:
         choices = raw.get("choices") or []
-        if not choices:
-            return None
-        msg = choices[0].get("message") or {}
-        tool_calls = msg.get("tool_calls") or []
-        for tc in tool_calls:
-            fn = tc.get("function") or {}
-            args = fn.get("arguments")
-            if isinstance(args, str):
-                obj = _parse_json_best_effort(args)
-                if isinstance(obj, dict):
-                    return obj
-            elif isinstance(args, dict):
-                return args
+        if choices:
+            msg = choices[0].get("message") or {}
+            tool_calls = msg.get("tool_calls") or []
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    obj = _parse_json_best_effort(args)
+                    if isinstance(obj, dict):
+                        return obj
+                elif isinstance(args, dict):
+                    return args
     except Exception:
         pass
 
@@ -794,27 +951,163 @@ def _extract_first_json_object(s: str) -> Optional[str]:
     return None
 
 
-# Env helpers
+# Generation evaluation helper
+
+GENERATION_EVALUATION_SYSTEM_PROMPT = """
+Ты независимый оценщик качества генерации в системе подготовки и защиты учебных работ.
+Твоя задача — оценить не студента и не саму учебную работу, а качество ответа, который сгенерировала тестируемая модель.
+
+Поставь целые оценки от 1 до 5 по пяти критериям:
+1. relevance — релевантность входному контексту и части сценария;
+2. completeness — полнота ответа относительно задачи генерации;
+3. clarity — ясность, структурность и понятность формулировок;
+4. usefulness — практическая полезность результата для пользователя сценария;
+5. correctness — корректность, отсутствие противоречий и необоснованных утверждений.
+
+Шкала:
+1 — результат почти непригоден;
+2 — много существенных проблем;
+3 — приемлемо, но есть заметные недостатки;
+4 — хороший результат с небольшими недочетами;
+5 — качественный результат без существенных замечаний.
+
+Верни только JSON по заданной схеме. Все оценки должны быть целыми числами от 1 до 5.
+В comment кратко объясни главную причину оценки на русском языке.
+""".strip()
 
 
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
+def _json_dumps_compact(value: Any, max_chars: int = 12000) -> str:
     try:
-        return int(str(v).strip())
-    except ValueError:
-        return default
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        text = str(value)
+    text = text.strip()
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n...[фрагмент сокращен]"
+    return text
 
 
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    try:
-        return float(str(v).strip().replace(",", "."))
-    except ValueError:
-        return default
+def build_generation_evaluation_prompt(
+        *,
+        scenario_part: str,
+        input_context: Any,
+        generated_output: Any,
+        method_name: Optional[str] = None,
+        extra_instruction: Optional[str] = None,
+) -> str:
+    """
+    Формирует пользовательский prompt для LLM-оценщика.
+
+    Важно: prompt описывает именно проверяемую генерацию. Формальные метрики
+    считаются отдельно в evaluation.py, а здесь модель оценивает смысловое
+    качество по пяти критериям.
+    """
+    method_block = f"\nМетод / этап: {method_name}" if method_name else ""
+    extra_block = f"\n\nДополнительные указания к оценке:\n{extra_instruction.strip()}" if extra_instruction else ""
+
+    return f"""
+Часть сценария: {scenario_part}{method_block}
+
+Входной контекст, на основе которого тестируемая модель должна была выполнить генерацию:
+{_json_dumps_compact(input_context)}
+
+Результат генерации тестируемой модели:
+{_json_dumps_compact(generated_output)}
+{extra_block}
+
+Оцени результат генерации по пяти критериям. Не сравнивай его с идеальным ответом, которого нет во входных данных. Оцени, насколько результат подходит для указанной части сценария и насколько он полезен в системе подготовки/защиты учебной работы.
+""".strip()
+
+
+def _normalize_generation_evaluation_response(data: JsonDict) -> JsonDict:
+    """
+    Приводит ответ LLM-оценщика к стабильному формату.
+
+    Даже при JSON-схеме совместимый провайдер может вернуть числа строками или
+    дробные значения. Для отчета нужны целые оценки 1–5.
+    """
+    normalized: JsonDict = {}
+    for key in ("relevance", "completeness", "clarity", "usefulness", "correctness"):
+        value = data.get(key)
+        try:
+            value_int = int(round(float(value)))
+        except Exception:
+            value_int = 1
+        normalized[key] = max(1, min(5, value_int))
+
+    comment = data.get("comment") or data.get("reason") or data.get("summary") or ""
+    normalized["comment"] = str(comment).strip()
+    return normalized
+
+
+def evaluate_generation_with_llm(
+        *,
+        scenario_part: str,
+        input_context: Any,
+        generated_output: Any,
+        method_name: Optional[str] = None,
+        extra_instruction: Optional[str] = None,
+        client: Optional[LLMClient] = None,
+        config: Optional[LLMConfig] = None,
+) -> JsonDict:
+    """
+    Оценивает качество одной генерации сторонней моделью.
+
+    Функция возвращает JSON со значениями 1–5:
+    relevance, completeness, clarity, usefulness, correctness, comment.
+
+    Эти значения затем передаются в evaluation.py, где средняя LLM-оценка
+    нормализуется по формуле (raw_score - 1) / 4 и объединяется с heuristic_score.
+    """
+    judge = client or LLMClient(config=config)
+    prompt = build_generation_evaluation_prompt(
+        scenario_part=scenario_part,
+        method_name=method_name,
+        input_context=input_context,
+        generated_output=generated_output,
+        extra_instruction=extra_instruction,
+    )
+
+    response = judge.generate(
+        system_prompt=GENERATION_EVALUATION_SYSTEM_PROMPT,
+        user_prompt=prompt,
+        schema_name="generation_evaluation",
+        strict_json=True,
+    )
+    if response.json is None:
+        raise LLMOutputParseError("Generation evaluation response was expected as JSON.")
+
+    result = _normalize_generation_evaluation_response(response.json)
+    result["judge_model"] = response.model
+    result["judge_latency_ms"] = response.latency_ms
+    return result
+
+
+# Smoke test
+
+def smoke_test() -> JsonDict:
+    """
+    Быстрая проверка из консоли:
+        python -c "from llm import smoke_test; print(smoke_test())"
+    """
+    client = LLMClient()
+    return client.generate_json(
+        schema_name="topic_relation_assessment",
+        system_prompt="Ты оцениваешь смысловую связь двух учебных тем. Верни только JSON.",
+        user_prompt=(
+            "Тема преподавателя: Классификация текстовых сообщений методами машинного обучения.\n"
+            "Описание преподавателя: Нужно разработать учебный прототип, который принимает короткий текст "
+            "на естественном языке, относит его к одному из заранее заданных классов и объясняет общий "
+            "принцип работы алгоритма.\n\n"
+            "Тема студента: Сортировка обращений граждан по подразделениям администрации.\n"
+            "Описание студента: Я хочу сделать программу, которая читает короткие обращения граждан и "
+            "автоматически предлагает, куда их направить: в отдел ЖКХ, транспорта, благоустройства или "
+            "социальной поддержки."
+        ),
+    )
 
 
 __all__ = [
@@ -828,9 +1121,14 @@ __all__ = [
     "LLMClient",
     "SCHEMA_REGISTRY",
     "get_json_schema",
+    "get_safe_config_summary",
     "call_llm",
     "call_llm_json",
     "create_llm_client",
     "build_llm_client",
     "get_llm_client",
+    "GENERATION_EVALUATION_SYSTEM_PROMPT",
+    "build_generation_evaluation_prompt",
+    "evaluate_generation_with_llm",
+    "smoke_test",
 ]

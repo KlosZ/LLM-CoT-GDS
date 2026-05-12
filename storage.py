@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 STATUS_DRAFT = "draft"
 STATUS_NEEDS_CLARIFICATION = "needs_clarification"
@@ -47,6 +47,16 @@ WORK_TYPE_RESEARCH = "research"
 WORK_TYPE_COURSEWORK = "coursework"
 WORK_TYPE_REPORT = "report"
 WORK_TYPE_OTHER = "other"
+
+EVALUATION_SCENARIO_TOPIC_FINAL = "topic_final"
+EVALUATION_SCENARIO_TOPIC_QUESTIONS = "topic_clarification_questions"
+EVALUATION_SCENARIO_TOPIC_PROCESS = "topic_alignment_process"
+EVALUATION_SCENARIO_DEFENSE_QUESTIONS = "defense_questions"
+
+EVALUATION_STATUS_CREATED = "created"
+EVALUATION_STATUS_RUNNING = "running"
+EVALUATION_STATUS_FINISHED = "finished"
+EVALUATION_STATUS_FAILED = "failed"
 
 
 # Helpers
@@ -324,6 +334,65 @@ class Storage:
 
             CREATE INDEX IF NOT EXISTS idx_policy_items_lab_id ON policy_items(lab_id);
             CREATE INDEX IF NOT EXISTS idx_policy_items_kind ON policy_items(kind);
+
+            CREATE TABLE IF NOT EXISTS evaluation_cases (
+                case_id TEXT PRIMARY KEY,
+                lab_id TEXT,
+                scenario_part TEXT NOT NULL,
+                method_name TEXT NOT NULL,
+                title TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                input_json TEXT NOT NULL DEFAULT '{}',
+                generated_output_json TEXT NOT NULL DEFAULT '{}',
+                expected_notes TEXT DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cases_lab_id ON evaluation_cases(lab_id);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cases_scenario_part ON evaluation_cases(scenario_part);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cases_method_name ON evaluation_cases(method_name);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cases_is_active ON evaluation_cases(is_active);
+
+            CREATE TABLE IF NOT EXISTS evaluation_runs (
+                run_id TEXT PRIMARY KEY,
+                title TEXT DEFAULT '',
+                model_name TEXT DEFAULT '',
+                judge_model_name TEXT DEFAULT '',
+                k REAL NOT NULL DEFAULT 0.7,
+                status TEXT NOT NULL DEFAULT 'created',
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evaluation_runs_status ON evaluation_runs(status);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_runs_created_at ON evaluation_runs(created_at);
+
+            CREATE TABLE IF NOT EXISTS evaluation_results (
+                result_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                case_id TEXT,
+                scenario_part TEXT NOT NULL,
+                method_name TEXT NOT NULL,
+                llm_scores_json TEXT NOT NULL DEFAULT '{}',
+                llm_score REAL,
+                heuristic_metrics_json TEXT NOT NULL DEFAULT '[]',
+                heuristic_score REAL,
+                final_score REAL,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                comment TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES evaluation_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY (case_id) REFERENCES evaluation_cases(case_id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evaluation_results_run_id ON evaluation_results(run_id);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_results_case_id ON evaluation_results(case_id);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_results_scenario_part ON evaluation_results(scenario_part);
             """
         )
 
@@ -1418,7 +1487,531 @@ class Storage:
             "agreed_spec": spec,
         }
 
+    # Evaluation cases / generation quality checks
+
+    def create_evaluation_case(
+            self,
+            *,
+            scenario_part: str,
+            method_name: str,
+            title: str = "",
+            description: str = "",
+            lab_id: Optional[str] = None,
+            input_data: Optional[dict[str, Any]] = None,
+            generated_output: Optional[dict[str, Any]] = None,
+            input_json: Optional[dict[str, Any]] = None,
+            generated_output_json: Optional[dict[str, Any]] = None,
+            expected_notes: str = "",
+            tags: Optional[list[str]] = None,
+            is_active: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Создает сохраненный кейс оценки генерации.
+
+        Это не unit-тест кода, а тестовый пример качества генерации:
+        входной контекст + результат генерации + часть сценария, которую нужно оценить.
+        """
+        case_id = new_id("ecase")
+        now = utc_now()
+        input_payload = input_json if input_json is not None else input_data
+        output_payload = generated_output_json if generated_output_json is not None else generated_output
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO evaluation_cases (
+                    case_id, lab_id, scenario_part, method_name, title, description,
+                    input_json, generated_output_json, expected_notes, tags_json,
+                    is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    case_id,
+                    lab_id,
+                    scenario_part,
+                    method_name,
+                    title,
+                    description,
+                    dumps_json(input_payload),
+                    dumps_json(output_payload),
+                    expected_notes,
+                    dumps_json(tags or []),
+                    1 if is_active else 0,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM evaluation_cases WHERE case_id = ?;",
+                (case_id,),
+            ).fetchone()
+            return self._decode_evaluation_case(row_to_dict(row))
+
+    def update_evaluation_case(
+            self,
+            case_id: str,
+            *,
+            scenario_part: Optional[str] = None,
+            method_name: Optional[str] = None,
+            title: Optional[str] = None,
+            description: Optional[str] = None,
+            lab_id: Optional[str] = None,
+            input_data: Optional[dict[str, Any]] = None,
+            generated_output: Optional[dict[str, Any]] = None,
+            input_json: Optional[dict[str, Any]] = None,
+            generated_output_json: Optional[dict[str, Any]] = None,
+            expected_notes: Optional[str] = None,
+            tags: Optional[list[str]] = None,
+            is_active: Optional[bool] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Обновляет сохраненный кейс оценки генерации.
+        """
+        current = self.get_evaluation_case(case_id)
+        if not current:
+            return None
+
+        input_payload = current["input_json"]
+        if input_data is not None:
+            input_payload = input_data
+        if input_json is not None:
+            input_payload = input_json
+
+        output_payload = current["generated_output_json"]
+        if generated_output is not None:
+            output_payload = generated_output
+        if generated_output_json is not None:
+            output_payload = generated_output_json
+
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE evaluation_cases
+                SET
+                    lab_id = ?,
+                    scenario_part = ?,
+                    method_name = ?,
+                    title = ?,
+                    description = ?,
+                    input_json = ?,
+                    generated_output_json = ?,
+                    expected_notes = ?,
+                    tags_json = ?,
+                    is_active = ?,
+                    updated_at = ?
+                WHERE case_id = ?;
+                """,
+                (
+                    lab_id if lab_id is not None else current["lab_id"],
+                    scenario_part if scenario_part is not None else current["scenario_part"],
+                    method_name if method_name is not None else current["method_name"],
+                    title if title is not None else current["title"],
+                    description if description is not None else current["description"],
+                    dumps_json(input_payload),
+                    dumps_json(output_payload),
+                    expected_notes if expected_notes is not None else current["expected_notes"],
+                    dumps_json(tags if tags is not None else current["tags_json"]),
+                    1 if (is_active if is_active is not None else current["is_active"]) else 0,
+                    now,
+                    case_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM evaluation_cases WHERE case_id = ?;",
+                (case_id,),
+            ).fetchone()
+            return self._decode_evaluation_case(row_to_dict(row))
+
+    def get_evaluation_case(self, case_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evaluation_cases WHERE case_id = ?;",
+                (case_id,),
+            ).fetchone()
+            return self._decode_evaluation_case(row_to_dict(row))
+
+    def list_evaluation_cases(
+            self,
+            *,
+            lab_id: Optional[str] = None,
+            scenario_part: Optional[str] = None,
+            method_name: Optional[str] = None,
+            active_only: bool = False,
+            limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+
+        if lab_id is not None:
+            where.append("lab_id = ?")
+            params.append(lab_id)
+        if scenario_part is not None:
+            where.append("scenario_part = ?")
+            params.append(scenario_part)
+        if method_name is not None:
+            where.append("method_name = ?")
+            params.append(method_name)
+        if active_only:
+            where.append("is_active = 1")
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM evaluation_cases
+                {where_sql}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?;
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [self._decode_evaluation_case(item) for item in rows_to_dicts(rows)]
+
+    def delete_evaluation_case(self, case_id: str) -> None:
+        """
+        Удаляет кейс. Результаты прошлых запусков сохраняются, но case_id в них станет NULL.
+        """
+        with self.connect() as conn:
+            conn.execute("DELETE FROM evaluation_cases WHERE case_id = ?;", (case_id,))
+
+    def create_evaluation_run(
+            self,
+            *,
+            title: str = "",
+            model_name: str = "",
+            judge_model_name: str = "",
+            k: float = 0.7,
+            status: str = EVALUATION_STATUS_CREATED,
+            meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Создает запуск оценки генерации.
+
+        k — коэффициент доверия к LLM-оценщику в формуле:
+        final_score = k * llm_score + (1 - k) * heuristic_score.
+        """
+        run_id = new_id("erun")
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO evaluation_runs (
+                    run_id, title, model_name, judge_model_name, k,
+                    status, meta_json, created_at, finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL);
+                """,
+                (
+                    run_id,
+                    title,
+                    model_name,
+                    judge_model_name,
+                    float(k),
+                    status,
+                    dumps_json(meta),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM evaluation_runs WHERE run_id = ?;",
+                (run_id,),
+            ).fetchone()
+            return self._decode_evaluation_run(row_to_dict(row))
+
+    def update_evaluation_run(
+            self,
+            run_id: str,
+            *,
+            title: Optional[str] = None,
+            model_name: Optional[str] = None,
+            judge_model_name: Optional[str] = None,
+            k: Optional[float] = None,
+            status: Optional[str] = None,
+            meta: Optional[dict[str, Any]] = None,
+            finished_at: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        current = self.get_evaluation_run(run_id)
+        if not current:
+            return None
+
+        merged_meta = current["meta_json"]
+        if meta is not None:
+            merged = dict(merged_meta)
+            merged.update(meta)
+            merged_meta = merged
+
+        resolved_status = status if status is not None else current["status"]
+        resolved_finished_at = finished_at
+        if resolved_finished_at is None:
+            resolved_finished_at = current.get("finished_at")
+        if status in {EVALUATION_STATUS_FINISHED, EVALUATION_STATUS_FAILED} and not resolved_finished_at:
+            resolved_finished_at = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE evaluation_runs
+                SET
+                    title = ?,
+                    model_name = ?,
+                    judge_model_name = ?,
+                    k = ?,
+                    status = ?,
+                    meta_json = ?,
+                    finished_at = ?
+                WHERE run_id = ?;
+                """,
+                (
+                    title if title is not None else current["title"],
+                    model_name if model_name is not None else current["model_name"],
+                    judge_model_name if judge_model_name is not None else current["judge_model_name"],
+                    float(k) if k is not None else current["k"],
+                    resolved_status,
+                    dumps_json(merged_meta),
+                    resolved_finished_at,
+                    run_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM evaluation_runs WHERE run_id = ?;",
+                (run_id,),
+            ).fetchone()
+            return self._decode_evaluation_run(row_to_dict(row))
+
+    def finish_evaluation_run(
+            self,
+            run_id: str,
+            *,
+            status: str = EVALUATION_STATUS_FINISHED,
+            meta: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Помечает запуск оценки завершенным или завершенным с ошибкой.
+        """
+        return self.update_evaluation_run(
+            run_id,
+            status=status,
+            meta=meta,
+            finished_at=utc_now(),
+        )
+
+    def get_evaluation_run(self, run_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evaluation_runs WHERE run_id = ?;",
+                (run_id,),
+            ).fetchone()
+            return self._decode_evaluation_run(row_to_dict(row))
+
+    def list_evaluation_runs(
+            self,
+            *,
+            status: Optional[str] = None,
+            limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE status = ?" if status else ""
+        params: tuple[Any, ...] = (status, limit) if status else (limit,)
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM evaluation_runs
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?;
+                """,
+                params,
+            ).fetchall()
+            return [self._decode_evaluation_run(item) for item in rows_to_dicts(rows)]
+
+    def delete_evaluation_run(self, run_id: str) -> None:
+        """
+        Удаляет запуск оценки и связанные с ним результаты.
+        """
+        with self.connect() as conn:
+            conn.execute("DELETE FROM evaluation_runs WHERE run_id = ?;", (run_id,))
+
+    def save_evaluation_result(
+            self,
+            *,
+            run_id: str,
+            case_id: Optional[str],
+            scenario_part: str,
+            method_name: str,
+            llm_scores: Optional[dict[str, Any]] = None,
+            llm_score: Optional[float] = None,
+            heuristic_metrics: Optional[list[dict[str, Any]]] = None,
+            heuristic_score: Optional[float] = None,
+            final_score: Optional[float] = None,
+            result: Optional[dict[str, Any]] = None,
+            comment: str = "",
+    ) -> dict[str, Any]:
+        """
+        Сохраняет результат оценки одного кейса в рамках запуска.
+        """
+        result_id = new_id("eres")
+        now = utc_now()
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO evaluation_results (
+                    result_id, run_id, case_id, scenario_part, method_name,
+                    llm_scores_json, llm_score, heuristic_metrics_json,
+                    heuristic_score, final_score, result_json, comment, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    result_id,
+                    run_id,
+                    case_id,
+                    scenario_part,
+                    method_name,
+                    dumps_json(llm_scores),
+                    llm_score,
+                    dumps_json(heuristic_metrics or []),
+                    heuristic_score,
+                    final_score,
+                    dumps_json(result),
+                    comment,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM evaluation_results WHERE result_id = ?;",
+                (result_id,),
+            ).fetchone()
+            return self._decode_evaluation_result(row_to_dict(row))
+
+    def save_evaluation_result_from_dict(
+            self,
+            *,
+            run_id: str,
+            case_id: Optional[str],
+            result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Удобный адаптер для результата из evaluation.py.
+        """
+        llm_block = result.get("llm_score") or {}
+        return self.save_evaluation_result(
+            run_id=run_id,
+            case_id=case_id,
+            scenario_part=str(result.get("scenario_part") or ""),
+            method_name=str(result.get("method_name") or ""),
+            llm_scores=llm_block.get("raw_scores") or llm_block,
+            llm_score=llm_block.get("normalized_score"),
+            heuristic_metrics=result.get("heuristic_metrics") or [],
+            heuristic_score=result.get("heuristic_score"),
+            final_score=result.get("final_score") or result.get("scenario_score"),
+            result=result,
+            comment=str(result.get("comment") or ""),
+        )
+
+    def get_evaluation_result(self, result_id: str) -> Optional[dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evaluation_results WHERE result_id = ?;",
+                (result_id,),
+            ).fetchone()
+            return self._decode_evaluation_result(row_to_dict(row))
+
+    def list_evaluation_results(
+            self,
+            *,
+            run_id: Optional[str] = None,
+            case_id: Optional[str] = None,
+            scenario_part: Optional[str] = None,
+            limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+
+        if run_id is not None:
+            where.append("run_id = ?")
+            params.append(run_id)
+        if case_id is not None:
+            where.append("case_id = ?")
+            params.append(case_id)
+        if scenario_part is not None:
+            where.append("scenario_part = ?")
+            params.append(scenario_part)
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM evaluation_results
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT ?;
+                """,
+                (*params, limit),
+            ).fetchall()
+            return [self._decode_evaluation_result(item) for item in rows_to_dicts(rows)]
+
+    def build_evaluation_report_rows(self, *, run_id: str) -> list[dict[str, Any]]:
+        """
+        Возвращает плоские строки для таблицы в Streamlit/CSV.
+        """
+        results = self.list_evaluation_results(run_id=run_id, limit=10000)
+        rows: list[dict[str, Any]] = []
+        for item in results:
+            case = self.get_evaluation_case(item["case_id"]) if item.get("case_id") else None
+            llm_scores = item.get("llm_scores_json") or {}
+            rows.append(
+                {
+                    "run_id": item.get("run_id"),
+                    "case_id": item.get("case_id"),
+                    "case_title": case.get("title", "") if case else "",
+                    "scenario_part": item.get("scenario_part"),
+                    "method_name": item.get("method_name"),
+                    "llm_relevance": llm_scores.get("relevance"),
+                    "llm_completeness": llm_scores.get("completeness"),
+                    "llm_clarity": llm_scores.get("clarity"),
+                    "llm_usefulness": llm_scores.get("usefulness"),
+                    "llm_correctness": llm_scores.get("correctness"),
+                    "llm_score": item.get("llm_score"),
+                    "heuristic_score": item.get("heuristic_score"),
+                    "final_score": item.get("final_score"),
+                    "comment": item.get("comment", ""),
+                    "heuristic_metrics_json": dumps_json(item.get("heuristic_metrics_json") or []),
+                    "result_json": dumps_json(item.get("result_json") or {}),
+                }
+            )
+        return rows
+
     # Decode helpers
+
+    def _decode_evaluation_case(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["input_json"] = loads_json(item.get("input_json"), default={})
+        item["generated_output_json"] = loads_json(item.get("generated_output_json"), default={})
+        item["tags_json"] = loads_json(item.get("tags_json"), default=[])
+        item["is_active"] = bool(item.get("is_active"))
+        return item
+
+    def _decode_evaluation_run(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["meta_json"] = loads_json(item.get("meta_json"), default={})
+        return item
+
+    def _decode_evaluation_result(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not item:
+            return None
+        item["llm_scores_json"] = loads_json(item.get("llm_scores_json"), default={})
+        item["heuristic_metrics_json"] = loads_json(item.get("heuristic_metrics_json"), default=[])
+        item["result_json"] = loads_json(item.get("result_json"), default={})
+        return item
 
     def _decode_lab(self, item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
         if not item:

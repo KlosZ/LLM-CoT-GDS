@@ -40,6 +40,27 @@ SYSTEM_STRICT_JSON = """\
 Запрещено: любой текст вне JSON, markdown, пояснения, лишние ключи.
 """
 
+SYSTEM_GENERATION_EVALUATOR_RU = """\
+Ты — независимый оценщик качества генерации в системе подготовки и защиты учебных работ.
+Твоя задача — оценивать не студента и не саму учебную работу, а ответ, который сгенерировала тестируемая модель.
+
+Оцени результат по пяти критериям целыми числами от 1 до 5:
+1) relevance — релевантность входному контексту и части сценария;
+2) completeness — полнота относительно задачи генерации;
+3) clarity — ясность, структурность и понятность формулировок;
+4) usefulness — практическая полезность для пользователя сценария;
+5) correctness — корректность, отсутствие противоречий и необоснованных утверждений.
+
+Шкала:
+1 — результат почти непригоден;
+2 — много существенных проблем;
+3 — приемлемо, но есть заметные недостатки;
+4 — хороший результат с небольшими недочетами;
+5 — качественный результат без существенных замечаний.
+
+Верни только JSON по заданной схеме. В comment кратко объясни главную причину оценки на русском языке.
+"""
+
 # Shared JSON schema building blocks
 
 
@@ -335,12 +356,126 @@ SCHEMA_POLICY_UPDATE_SUGGESTION: JsonDict = {
     "required": ["good_items_to_add", "bad_items_to_add", "policy_notes"],
 }
 
+SCHEMA_GENERATION_EVALUATION: JsonDict = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "relevance": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Релевантность результата входному контексту и части сценария.",
+        },
+        "completeness": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Полнота результата относительно задачи генерации.",
+        },
+        "clarity": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Ясность, структурность и понятность формулировок.",
+        },
+        "usefulness": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Практическая полезность результата для пользователя сценария.",
+        },
+        "correctness": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Корректность, отсутствие противоречий и необоснованных утверждений.",
+        },
+        "comment": {
+            "type": "string",
+            "description": "Краткое объяснение оценки на русском языке.",
+        },
+    },
+    "required": [
+        "relevance",
+        "completeness",
+        "clarity",
+        "usefulness",
+        "correctness",
+        "comment",
+    ],
+}
+
 
 # Prompt builders
 
 
 def _json_pretty(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def _json_pretty_limited(obj: Any, *, max_chars: int = 12000) -> str:
+    """
+    Форматирует объект для промпта и ограничивает размер, чтобы оценщик
+    не получал чрезмерно длинный контекст.
+    """
+    if isinstance(obj, str):
+        text = obj.strip()
+    else:
+        text = _json_pretty(obj)
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n...[фрагмент сокращен]"
+    return text
+
+
+def build_generation_evaluation_prompt(
+        *,
+        scenario_part: str,
+        input_context: Any,
+        generated_output: Any,
+        method_name: Optional[str] = None,
+        extra_instruction: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Формирует prompt для сторонней LLM-оценки качества генерации.
+
+    Функция используется в новом контуре оценки генерации. Модель-оценщик
+    выставляет пять целых оценок от 1 до 5, а дальнейшая нормализация и
+    объединение с эвристиками выполняются в evaluation.py.
+    """
+    system = SYSTEM_GENERATION_EVALUATOR_RU + "\n\n" + SYSTEM_STRICT_JSON
+
+    method_block = f"\nМетод / этап: {method_name}" if method_name else ""
+    extra_block = (
+        f"\n\nДополнительные указания к оценке:\n{extra_instruction.strip()}"
+        if extra_instruction
+        else ""
+    )
+
+    user = f"""\
+Часть сценария: {scenario_part}{method_block}
+
+Входной контекст, на основе которого тестируемая модель должна была выполнить генерацию:
+{_json_pretty_limited(input_context)}
+
+Результат генерации тестируемой модели:
+{_json_pretty_limited(generated_output)}
+{extra_block}
+
+ЗАДАЧА:
+Оцени именно качество результата генерации для указанной части сценария.
+Не оценивай студента, преподавателя или исходную учебную работу.
+Не требуй сведений, которых невозможно вывести из входного контекста.
+
+Критерии оценки:
+- relevance: связан ли результат с входными данными и нужным этапом сценария;
+- completeness: хватает ли результата для выполнения задачи этапа;
+- clarity: понятны ли формулировки и структура;
+- usefulness: поможет ли результат пользователю системы;
+- correctness: нет ли противоречий, выдуманных фактов и необоснованных утверждений.
+
+Верни JSON по схеме generation_evaluation.
+"""
+    return system, user
 
 
 def build_methodics_and_bank_prompt(
@@ -676,4 +811,5 @@ SCHEMAS: JsonDict = {
     "answer_eval": SCHEMA_ANSWER_EVAL,
     "teacher_calibration_batch": SCHEMA_TEACHER_CALIBRATION_BATCH,
     "policy_update_suggestion": SCHEMA_POLICY_UPDATE_SUGGESTION,
+    "generation_evaluation": SCHEMA_GENERATION_EVALUATION,
 }
