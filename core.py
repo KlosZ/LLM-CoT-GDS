@@ -825,6 +825,151 @@ class ProjectCore:
         """
         self.storage.delete_evaluation_case(case_id)
 
+    def import_evaluation_cases_from_csv(
+            self,
+            csv_content: str | bytes,
+            *,
+            lab_id: Optional[str] = None,
+            attach_to_lab: bool = True,
+            update_existing: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Импортирует тест-кейсы оценки генерации из CSV.
+
+        CSV используется как переносимый источник тестов: заказчик или
+        разработчик может подготовить 20-25 кейсов в таблице, загрузить файл во
+        вкладке "Оценка генерации", а затем получить итоговый отчет через уже
+        существующий экспорт результатов в CSV/JSON.
+
+        Если attach_to_lab=True, все импортированные кейсы привязываются к
+        текущему заданию. Если False, кейсы создаются как общие и будут видны при
+        выборе области проверки "Все задания".
+
+        Дубликат определяется по тройке:
+        title + scenario_part + method_name.
+        """
+        if lab_id and attach_to_lab:
+            self.get_lab(lab_id)
+
+        from evaluation_case_csv import parse_evaluation_cases_csv
+
+        parsed = parse_evaluation_cases_csv(csv_content)
+        cases = parsed.get("cases") or []
+        parse_errors = parsed.get("errors") or []
+
+        target_lab_id = lab_id if attach_to_lab else None
+        existing_cases = self.storage.list_evaluation_cases(
+            lab_id=target_lab_id,
+            active_only=False,
+            limit=10000,
+        )
+        existing_by_key = {
+            (
+                str(item.get("title") or "").strip().lower(),
+                str(item.get("scenario_part") or "").strip(),
+                str(item.get("method_name") or "").strip(),
+            ): item
+            for item in existing_cases
+        }
+
+        imported: list[dict[str, Any]] = []
+        updated: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = list(parse_errors)
+
+        for case in cases:
+            key = (
+                str(case.get("title") or "").strip().lower(),
+                str(case.get("scenario_part") or "").strip(),
+                str(case.get("method_name") or "").strip(),
+            )
+            existing = existing_by_key.get(key)
+
+            payload = {
+                "scenario_part": case.get("scenario_part") or "",
+                "method_name": case.get("method_name") or "",
+                "title": case.get("title") or "",
+                "description": case.get("description") or "",
+                "lab_id": target_lab_id,
+                "input_json": case.get("input_json") or {},
+                "generated_output_json": case.get("generated_output_json") or {},
+                "expected_notes": case.get("expected_notes") or "",
+                "tags": case.get("tags") or [],
+                "is_active": bool(case.get("is_active", True)),
+            }
+
+            try:
+                if existing and not update_existing:
+                    skipped.append(
+                        {
+                            "case_id": existing.get("case_id"),
+                            "title": existing.get("title"),
+                            "reason": "Кейс с таким title + scenario_part + method_name уже существует.",
+                        }
+                    )
+                    continue
+
+                if existing and update_existing:
+                    updated_case = self.update_evaluation_case(
+                        existing["case_id"],
+                        scenario_part=payload["scenario_part"],
+                        method_name=payload["method_name"],
+                        title=payload["title"],
+                        description=payload["description"],
+                        input_json=payload["input_json"],
+                        generated_output_json=payload["generated_output_json"],
+                        expected_notes=payload["expected_notes"],
+                        tags=payload["tags"],
+                        is_active=payload["is_active"],
+                    )
+                    updated.append(updated_case or existing)
+                    continue
+
+                created = self.create_evaluation_case(**payload)
+                imported.append(created)
+                existing_by_key[key] = created
+            except Exception as exc:
+                errors.append(
+                    {
+                        "case_code": case.get("case_code"),
+                        "title": case.get("title"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+        return {
+            "total_rows": len(cases) + len(parse_errors),
+            "parsed_cases": len(cases),
+            "imported_count": len(imported),
+            "updated_count": len(updated),
+            "skipped_count": len(skipped),
+            "error_count": len(errors),
+            "imported": imported,
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    def import_default_evaluation_cases_csv(
+            self,
+            *,
+            lab_id: Optional[str] = None,
+            attach_to_lab: bool = True,
+            update_existing: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Загружает встроенный CSV-набор из data/evaluation_cases_default.csv.
+        """
+        from evaluation_case_csv import load_default_evaluation_cases_csv
+
+        csv_content = load_default_evaluation_cases_csv()
+        return self.import_evaluation_cases_from_csv(
+            csv_content,
+            lab_id=lab_id,
+            attach_to_lab=attach_to_lab,
+            update_existing=update_existing,
+        )
+
     def create_topic_final_evaluation_case_from_lab(
             self,
             *,

@@ -4,21 +4,13 @@ import csv
 import io
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import streamlit as st
-
-try:
-    from dotenv import load_dotenv  # type: ignore
-
-    dotenv_override = (
-                              os.getenv("LLM_DOTENV_OVERRIDE")
-                              or os.getenv("DOTENV_OVERRIDE")
-                              or "1"
-                      ).strip().lower() not in {"0", "false", "no", "off"}
-    load_dotenv(override=dotenv_override)
-except Exception:
-    pass
+from streamlit import runtime
+from streamlit.web import cli as stcli
 
 from core import ProjectCore, create_core
 from storage import (
@@ -35,6 +27,20 @@ from storage import (
     WORK_TYPE_REPORT,
     WORK_TYPE_RESEARCH,
 )
+
+runtime.exists()
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    dotenv_override = (
+                              os.getenv("LLM_DOTENV_OVERRIDE")
+                              or os.getenv("DOTENV_OVERRIDE")
+                              or "1"
+                      ).strip().lower() not in {"0", "false", "no", "off"}
+    load_dotenv(override=dotenv_override)
+except Exception:
+    pass
 
 APP_TITLE = "Система формирования и защиты учебных заданий"
 APP_CAPTION = (
@@ -1164,6 +1170,104 @@ def render_evaluation_tab(core: ProjectCore, dashboard: dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(f"Не удалось создать кейс: {type(exc).__name__}: {exc}")
 
+    with st.expander("Импорт кейсов из CSV / демонстрационный набор"):
+        st.caption(
+            "CSV нужен для массовой загрузки тест-кейсов: можно подготовить 20–25 строк в таблице, "
+            "импортировать их в базу, затем запустить оценку и скачать итоговый отчет CSV. "
+            "Встроенный файл data/evaluation_cases_default.csv содержит 20 демонстрационных кейсов: "
+            "15 по согласованию темы и 5 по вопросам защиты."
+        )
+
+        default_csv_path = Path("data/evaluation_cases_default.csv")
+        if default_csv_path.exists():
+            default_csv_bytes = default_csv_path.read_bytes()
+            st.download_button(
+                "Скачать демонстрационный CSV с 20 кейсами",
+                data=default_csv_bytes,
+                file_name="evaluation_cases_default.csv",
+                mime="text/csv",
+            )
+        else:
+            st.warning("Файл data/evaluation_cases_default.csv не найден. Проверьте, что он добавлен в проект.")
+
+        uploaded_cases_csv = st.file_uploader(
+            "Загрузить CSV с тест-кейсами",
+            type=["csv"],
+            key=f"evaluation_cases_csv_upload_{lab_id}",
+            help=(
+                "Ожидаемые колонки: case_code, title, description, scenario_part, method_name, "
+                "input_json, generated_output_json, expected_notes, tags, is_active."
+            ),
+        )
+
+        col_import_1, col_import_2 = st.columns(2)
+        with col_import_1:
+            attach_import_to_lab = st.checkbox(
+                "Привязать импортированные кейсы к текущему заданию",
+                value=True,
+                key=f"evaluation_attach_import_to_lab_{lab_id}",
+                help="Если выключить, кейсы будут общими и появятся при выборе области проверки «Все задания».",
+            )
+        with col_import_2:
+            update_existing_cases = st.checkbox(
+                "Обновлять существующие кейсы с тем же названием",
+                value=False,
+                key=f"evaluation_update_existing_cases_{lab_id}",
+                help="Дубликат ищется по title + scenario_part + method_name.",
+            )
+
+        col_seed, col_upload = st.columns(2)
+        with col_seed:
+            if st.button("Загрузить встроенные 20 кейсов в базу"):
+                try:
+                    summary = core.import_default_evaluation_cases_csv(
+                        lab_id=lab_id,
+                        attach_to_lab=attach_import_to_lab,
+                        update_existing=update_existing_cases,
+                    )
+                    st.success(
+                        "Импорт завершен: "
+                        f"добавлено {summary['imported_count']}, "
+                        f"обновлено {summary['updated_count']}, "
+                        f"пропущено {summary['skipped_count']}, "
+                        f"ошибок {summary['error_count']}."
+                    )
+                    if summary.get("errors"):
+                        st.json(summary["errors"])
+                    rerun()
+                except Exception as exc:
+                    st.error(f"Не удалось загрузить встроенный CSV: {type(exc).__name__}: {exc}")
+
+        with col_upload:
+            if st.button("Импортировать загруженный CSV"):
+                if uploaded_cases_csv is None:
+                    st.warning("Сначала выберите CSV-файл с тест-кейсами.")
+                else:
+                    try:
+                        summary = core.import_evaluation_cases_from_csv(
+                            uploaded_cases_csv.getvalue(),
+                            lab_id=lab_id,
+                            attach_to_lab=attach_import_to_lab,
+                            update_existing=update_existing_cases,
+                        )
+                        st.success(
+                            "Импорт завершен: "
+                            f"добавлено {summary['imported_count']}, "
+                            f"обновлено {summary['updated_count']}, "
+                            f"пропущено {summary['skipped_count']}, "
+                            f"ошибок {summary['error_count']}."
+                        )
+                        if summary.get("errors"):
+                            st.json(summary["errors"])
+                        rerun()
+                    except Exception as exc:
+                        st.error(f"Не удалось импортировать CSV: {type(exc).__name__}: {exc}")
+
+        st.markdown(
+            "После импорта оставьте фильтр «Все» или выберите нужную часть сценария, "
+            "нажмите «Запустить оценку по выбранным кейсам», а затем скачайте итоговую таблицу CSV."
+        )
+
     st.divider()
     st.markdown("### 2. Сохраненные кейсы")
 
@@ -1468,4 +1572,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Если runtime существует
+    if runtime.exists():
+        # Вызываем функцию main()
+        main()
+    # Если runtime не существует
+    else:
+        # Устанавливаем аргументы командной строки
+        sys.argv = ["streamlit", "run", sys.argv[0]]
+        # Выходим из программы с помощью функции main() из модуля stcli
+        sys.exit(stcli.main())
